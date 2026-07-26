@@ -40,11 +40,19 @@ const DOCS: Record<AgentId, string> = {
   opencode: 'https://opencode.ai/docs/mcp-servers/',
 };
 
+interface MatrixVariant {
+  id: string;
+  occurrences: Map<AgentId, PublicMcpOccurrence[]>;
+  representative: PublicMcpOccurrence;
+  divergent: boolean;
+}
+
 interface MatrixRow {
   id: string;
   displayName: string;
-  occurrences: Map<AgentId, PublicMcpOccurrence>;
+  occurrences: Map<AgentId, PublicMcpOccurrence[]>;
   representative: PublicMcpOccurrence;
+  variants: MatrixVariant[];
   divergent: boolean;
   nameCollision: boolean;
 }
@@ -52,6 +60,7 @@ interface MatrixRow {
 interface Selection {
   rowId?: string;
   occurrenceId?: string;
+  compareOccurrenceId?: string;
   agentId?: AgentId;
 }
 
@@ -102,57 +111,136 @@ function buildRows(snapshot: SnapshotResponse | undefined): MatrixRow[] {
   const groups = new Map<string, PublicMcpOccurrence[]>();
   for (const occurrence of snapshot.occurrences) {
     if (!occurrence.source.effective) continue;
-    const values = groups.get(occurrence.identityFingerprint) ?? [];
+    const values = groups.get(occurrence.familyFingerprint) ?? [];
     values.push(occurrence);
-    groups.set(occurrence.identityFingerprint, values);
+    groups.set(occurrence.familyFingerprint, values);
   }
-  const namesByIdentity = new Map<string, Set<string>>();
-  for (const [identity, values] of groups) {
+  const namesByFamily = new Map<string, Set<string>>();
+  for (const [family, values] of groups) {
     for (const value of values) {
       const normalized = value.name.toLocaleLowerCase();
-      const identities = namesByIdentity.get(normalized) ?? new Set<string>();
-      identities.add(identity);
-      namesByIdentity.set(normalized, identities);
+      const families = namesByFamily.get(normalized) ?? new Set<string>();
+      families.add(family);
+      namesByFamily.set(normalized, families);
     }
   }
 
   return [...groups.entries()]
-    .map(([identity, values]) => {
+    .map(([family, values]) => {
       const nameCounts = new Map<string, number>();
       for (const value of values) nameCounts.set(value.name, (nameCounts.get(value.name) ?? 0) + 1);
       const displayName = [...nameCounts].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0][0];
-      const representative = values.find((value) => value.enabled) ?? values[0];
+      const identityGroups = new Map<string, PublicMcpOccurrence[]>();
+      for (const value of values) {
+        const identityValues = identityGroups.get(value.identityFingerprint) ?? [];
+        identityValues.push(value);
+        identityGroups.set(value.identityFingerprint, identityValues);
+      }
+      const variants = [...identityGroups.entries()]
+        .map(([identity, identityValues]) => {
+          const identityOccurrences = new Map<AgentId, PublicMcpOccurrence[]>();
+          for (const value of identityValues) {
+            const agentValues = identityOccurrences.get(value.agentId) ?? [];
+            agentValues.push(value);
+            identityOccurrences.set(value.agentId, agentValues);
+          }
+          return {
+            id: identity,
+            occurrences: identityOccurrences,
+            representative: identityValues.find((value) => value.enabled) ?? identityValues[0],
+            divergent: new Set(identityValues.map((value) => value.configFingerprint)).size > 1,
+          };
+        })
+        .sort(
+          (left, right) =>
+            right.occurrences.size - left.occurrences.size ||
+            left.representative.name.localeCompare(right.representative.name) ||
+            left.id.localeCompare(right.id),
+        );
+      const occurrences = new Map<AgentId, PublicMcpOccurrence[]>();
+      for (const value of values) {
+        const agentValues = occurrences.get(value.agentId) ?? [];
+        agentValues.push(value);
+        occurrences.set(value.agentId, agentValues);
+      }
       return {
-        id: identity,
+        id: family,
         displayName,
-        occurrences: new Map(values.map((value) => [value.agentId, value])),
-        representative,
-        divergent: new Set(values.map((value) => value.configFingerprint)).size > 1,
+        occurrences,
+        representative: variants[0].representative,
+        variants,
+        divergent: variants.some((variant) => variant.divergent),
         nameCollision: values.some(
-          (value) => (namesByIdentity.get(value.name.toLocaleLowerCase())?.size ?? 0) > 1,
+          (value) => (namesByFamily.get(value.name.toLocaleLowerCase())?.size ?? 0) > 1,
         ),
       };
     })
     .sort((left, right) => left.displayName.localeCompare(right.displayName));
 }
 
-function cellStatus(row: MatrixRow, occurrence: PublicMcpOccurrence | undefined): string {
-  if (!occurrence) return 'Not configured';
+function targetNameConflict(
+  snapshot: SnapshotResponse | undefined,
+  row: MatrixRow,
+  targetAgentId: AgentId,
+  name = row.representative.name,
+): PublicMcpOccurrence | undefined {
+  return snapshot?.occurrences.find(
+    (occurrence) =>
+      occurrence.source.effective &&
+      occurrence.agentId === targetAgentId &&
+      occurrence.name === name &&
+      occurrence.familyFingerprint !== row.id,
+  );
+}
+
+function targetExactNameConflict(
+  snapshot: SnapshotResponse | undefined,
+  targetAgentId: AgentId,
+  source: PublicMcpOccurrence,
+): PublicMcpOccurrence | undefined {
+  return snapshot?.occurrences.find(
+    (occurrence) =>
+      occurrence.source.effective &&
+      occurrence.agentId === targetAgentId &&
+      occurrence.name === source.name &&
+      occurrence.identityFingerprint !== source.identityFingerprint,
+  );
+}
+
+function cellStatus(
+  row: MatrixRow,
+  occurrences: PublicMcpOccurrence[],
+  conflict?: PublicMcpOccurrence,
+): string {
+  if (!occurrences.length) return conflict ? 'Name conflict' : 'Not configured';
+  if (occurrences.length > 1) return `${occurrences.length} variants`;
+  const occurrence = occurrences[0];
   if (occurrence.transport.kind === 'unknown' || occurrence.warnings.some((warning) => /missing|invalid/i.test(warning))) {
     return 'Invalid';
   }
   if (!occurrence.enabled) return 'Disabled';
+  if (row.variants.length > 1) {
+    const index = row.variants.findIndex((variant) => variant.id === occurrence.identityFingerprint);
+    return `Variant ${index + 1} of ${row.variants.length}`;
+  }
   if (row.divergent) return 'Different options';
   if (occurrence.source.scope !== 'user') return `Inherited · ${occurrence.source.scope}`;
   return 'Configured';
 }
 
-function statusClass(row: MatrixRow, occurrence: PublicMcpOccurrence | undefined): string {
-  if (!occurrence) return 'empty';
+function statusClass(
+  row: MatrixRow,
+  occurrences: PublicMcpOccurrence[],
+  conflict?: PublicMcpOccurrence,
+): string {
+  if (!occurrences.length) return conflict ? 'conflict' : 'empty';
+  if (occurrences.length > 1) return 'variant';
+  const occurrence = occurrences[0];
   if (occurrence.transport.kind === 'unknown' || occurrence.warnings.some((warning) => /missing|invalid/i.test(warning))) {
     return 'invalid';
   }
   if (!occurrence.enabled) return 'disabled';
+  if (row.variants.length > 1) return 'variant';
   if (row.divergent) return 'divergent';
   if (occurrence.source.scope !== 'user') return 'inherited';
   return 'configured';
@@ -162,6 +250,8 @@ function StatusMark({ status }: { status: string }) {
   if (status === 'empty') return <Plus size={13} />;
   if (status === 'invalid') return <AlertTriangle size={13} />;
   if (status === 'disabled') return <Minus size={13} />;
+  if (status === 'conflict') return <AlertTriangle size={13} />;
+  if (status === 'variant') return <GitCompare size={13} />;
   if (status === 'divergent') return <GitCompare size={13} />;
   return <Check size={13} />;
 }
@@ -203,7 +293,15 @@ function App() {
     const query = search.trim().toLocaleLowerCase();
     if (!query) return rows;
     return rows.filter((row) =>
-      [row.displayName, row.representative.transport.kind, ...[...row.occurrences.values()].map((value) => value.name)]
+      [
+        row.displayName,
+        row.representative.transport.kind,
+        ...[...row.occurrences.values()].flat().flatMap((value) => [
+          value.name,
+          value.transport.commandPreview ?? '',
+          value.transport.endpointOrigin ?? '',
+        ]),
+      ]
         .join(' ')
         .toLocaleLowerCase()
         .includes(query),
@@ -213,6 +311,9 @@ function App() {
   const selectedRow = rows.find((row) => row.id === selection.rowId);
   const selectedOccurrence = snapshot?.occurrences.find(
     (occurrence) => occurrence.occurrenceId === selection.occurrenceId,
+  );
+  const comparedOccurrence = snapshot?.occurrences.find(
+    (occurrence) => occurrence.occurrenceId === selection.compareOccurrenceId,
   );
   const selectedAgent = snapshot?.agents.find((agent) => agent.id === selection.agentId);
 
@@ -245,11 +346,17 @@ function App() {
   );
 
   const selectCell = (row: MatrixRow, agentId: AgentId) => {
-    const occurrence = row.occurrences.get(agentId);
-    if (occurrence) {
-      setSelection({ rowId: row.id, occurrenceId: occurrence.occurrenceId, agentId });
-    } else {
-      setSelection({ rowId: row.id, agentId });
+    const occurrences = row.occurrences.get(agentId) ?? [];
+    if (occurrences.length === 1) {
+      setSelection({ rowId: row.id, occurrenceId: occurrences[0].occurrenceId, agentId });
+      return;
+    }
+    setSelection({ rowId: row.id, agentId });
+    if (
+      occurrences.length === 0 &&
+      row.variants.length === 1 &&
+      !targetNameConflict(snapshot, row, agentId)
+    ) {
       void requestPlan(row.representative.occurrenceId, agentId);
     }
   };
@@ -299,12 +406,18 @@ function App() {
     const draggedOccurrence = snapshot?.occurrences.find(
       (occurrence) => occurrence.occurrenceId === occurrenceId,
     );
-    if (!draggedOccurrence || draggedOccurrence.identityFingerprint !== row.id) {
-      setError('Drop onto an empty cell in the same MCP row.');
+    if (!draggedOccurrence || draggedOccurrence.familyFingerprint !== row.id) {
+      setError('Drop onto an empty cell in the same MCP family.');
       return;
     }
-    if (row.occurrences.has(targetAgentId)) {
-      setError('That agent already has this MCP identity configured.');
+    if ((row.occurrences.get(targetAgentId)?.length ?? 0) > 0) {
+      setError('That agent already has a variant of this MCP family configured.');
+      return;
+    }
+    const conflict = targetNameConflict(snapshot, row, targetAgentId, draggedOccurrence.name);
+    if (conflict) {
+      setSelection({ rowId: row.id, agentId: targetAgentId });
+      setError(`The target name is already used by another MCP identity. Compare it before copying.`);
       return;
     }
     void requestPlan(occurrenceId, targetAgentId);
@@ -351,7 +464,9 @@ function App() {
             <div className="panel-toolbar">
               <div>
                 <h1>MCP inventory</h1>
-                <p>{rows.length} identities across {AGENT_ORDER.length} agents</p>
+                <p>
+                  {rows.length} families · {rows.reduce((count, row) => count + row.variants.length, 0)} exact variants across {AGENT_ORDER.length} agents
+                </p>
               </div>
               <label className="search-box">
                 <Search size={13} />
@@ -371,6 +486,27 @@ function App() {
                 <span>{error}</span>
                 <button type="button" onClick={() => setError(undefined)}><X size={13} /></button>
               </div>
+            )}
+
+            {snapshot && snapshot.issues.length > 0 && (
+              <details className="config-issues">
+                <summary>
+                  <AlertTriangle size={14} />
+                  <span>{snapshot.issues.length} native configuration {snapshot.issues.length === 1 ? 'file could' : 'files could'} not be read</span>
+                  <small>Show details</small>
+                </summary>
+                <div className="config-issue-list">
+                  {snapshot.issues.map((issue) => (
+                    <div className="config-issue" key={`${issue.agentId}:${issue.path}`}>
+                      <AgentIcon id={issue.agentId} size={14} />
+                      <div><strong>{issue.agentId}</strong><code>{issue.path}</code><p>{issue.message}</p></div>
+                    </div>
+                  ))}
+                  <button type="button" onClick={() => void scan(snapshot.workspace)} disabled={loading}>
+                    <RefreshCw size={12} className={loading ? 'spin' : ''} /> Refresh
+                  </button>
+                </div>
+              </details>
             )}
 
             <div className="matrix-scroll">
@@ -416,22 +552,42 @@ function App() {
                         <span className="server-icon"><MCP size={15} /></span>
                         <span className="server-copy">
                           <strong>{row.displayName}</strong>
-                          <small>{row.representative.transport.kind}</small>
+                          <small>
+                            {row.representative.transport.kind}
+                            {row.variants.length > 1 ? ` · ${row.variants.length} variants` : ''}
+                          </small>
                         </span>
-                        {(row.divergent || row.nameCollision) && <GitCompare size={13} className="row-warning" />}
+                        {(row.variants.length > 1 || row.divergent || row.nameCollision) && <GitCompare size={13} className="row-warning" />}
                       </button>
                       {AGENT_ORDER.map((agentId) => {
-                        const occurrence = row.occurrences.get(agentId);
-                        const status = statusClass(row, occurrence);
+                        const occurrences = row.occurrences.get(agentId) ?? [];
+                        const occurrence = occurrences.length === 1 ? occurrences[0] : undefined;
+                        const conflict = occurrences.length ? undefined : targetNameConflict(snapshot, row, agentId);
+                        const status = statusClass(row, occurrences, conflict);
                         const dropId = `${row.id}:${agentId}`;
                         return (
                           <button
-                            className={`matrix-cell ${status} ${occurrence && selection.occurrenceId === occurrence.occurrenceId ? 'selected' : ''} ${dragTarget === dropId ? 'drag-target' : ''}`}
+                            className={`matrix-cell ${status} ${
+                              (occurrence && selection.occurrenceId === occurrence.occurrenceId) ||
+                              (!selection.occurrenceId && selection.rowId === row.id && selection.agentId === agentId)
+                                ? 'selected'
+                                : ''
+                            } ${dragTarget === dropId ? 'drag-target' : ''}`}
                             key={agentId}
                             type="button"
                             role="gridcell"
                             draggable={Boolean(occurrence)}
-                            title={occurrence ? `${cellStatus(row, occurrence)} — drag to copy` : `Copy ${row.displayName} to ${agentId}`}
+                            title={
+                              occurrence
+                                ? `${cellStatus(row, occurrences)} — drag to copy this exact variant`
+                                : conflict
+                                  ? `Compare ${row.displayName} with the existing "${conflict.name}" entry`
+                                  : occurrences.length > 1
+                                    ? `Inspect ${occurrences.length} exact variants`
+                                    : row.variants.length > 1
+                                      ? `Choose an exact variant to copy to ${agentId}`
+                                      : `Copy ${row.displayName} to ${agentId}`
+                            }
                             onClick={() => selectCell(row, agentId)}
                             onDragStart={(event) => {
                               if (!occurrence) return;
@@ -440,7 +596,7 @@ function App() {
                               event.dataTransfer.setData('text/plain', occurrence.occurrenceId);
                             }}
                             onDragOver={(event) => {
-                              if (occurrence) return;
+                              if (occurrences.length || conflict) return;
                               event.preventDefault();
                               event.dataTransfer.dropEffect = 'copy';
                               setDragTarget(dropId);
@@ -456,7 +612,7 @@ function App() {
                           >
                             <span className="status-mark"><StatusMark status={status} /></span>
                             <span className="cell-copy">
-                              <strong>{cellStatus(row, occurrence)}</strong>
+                              <strong>{cellStatus(row, occurrences, conflict)}</strong>
                               {occurrence && (occurrence.name !== row.displayName || occurrence.source.scope) && (
                                 <small>
                                   {occurrence.name !== row.displayName
@@ -464,6 +620,8 @@ function App() {
                                     : occurrence.source.scope}
                                 </small>
                               )}
+                              {occurrences.length > 1 && <small>select to compare</small>}
+                              {conflict && <small>{conflict.name}</small>}
                             </span>
                             {occurrence && <GripVertical size={12} className="drag-handle" />}
                           </button>
@@ -478,6 +636,8 @@ function App() {
             <footer className="legend-bar">
               <span><i className="dot configured" />Configured</span>
               <span><i className="dot inherited" />Inherited</span>
+              <span><i className="dot variant" />Variant</span>
+              <span><i className="dot conflict" />Conflict</span>
               <span><i className="dot divergent" />Different</span>
               <span><i className="dot disabled" />Disabled</span>
               <span><i className="dot invalid" />Invalid</span>
@@ -489,9 +649,17 @@ function App() {
             snapshot={snapshot}
             row={selectedRow}
             occurrence={selectedOccurrence}
+            comparison={comparedOccurrence}
             agent={selectedAgent}
+            targetAgentId={selection.agentId}
             planning={planning}
             onCopy={requestPlan}
+            onInspectOccurrence={(occurrenceId, rowId, agentId) =>
+              setSelection({ occurrenceId, rowId, agentId })
+            }
+            onCompare={(occurrenceId, compareOccurrenceId, rowId, agentId) =>
+              setSelection({ occurrenceId, compareOccurrenceId, rowId, agentId })
+            }
           />
         </div>
       </div>
@@ -556,24 +724,91 @@ function Inspector({
   snapshot,
   row,
   occurrence,
+  comparison,
   agent,
+  targetAgentId,
   planning,
   onCopy,
+  onInspectOccurrence,
+  onCompare,
 }: {
   snapshot?: SnapshotResponse;
   row?: MatrixRow;
   occurrence?: PublicMcpOccurrence;
+  comparison?: PublicMcpOccurrence;
   agent?: AgentSnapshot;
+  targetAgentId?: AgentId;
   planning: boolean;
   onCopy: (occurrenceId: string, targetAgentId: AgentId) => Promise<void>;
+  onInspectOccurrence: (occurrenceId: string, rowId: string, agentId: AgentId) => void;
+  onCompare: (
+    occurrenceId: string,
+    compareOccurrenceId: string,
+    rowId: string,
+    agentId: AgentId,
+  ) => void;
 }) {
+  if (occurrence && comparison) {
+    const cards = [
+      { label: 'Selected variant', value: occurrence },
+      { label: 'Existing target', value: comparison },
+    ];
+    return (
+      <aside className="inspector-panel">
+        <div className="inspector-header">
+          <span className="inspector-icon conflict-icon"><GitCompare size={18} /></span>
+          <div><h2>Name conflict</h2><p>Compare exact MCP identities</p></div>
+        </div>
+        <div className="comparison-summary">
+          <span className={occurrence.familyFingerprint === comparison.familyFingerprint ? 'same' : 'different'}>
+            {occurrence.familyFingerprint === comparison.familyFingerprint ? 'Same family' : 'Different families'}
+          </span>
+          <strong>Exact identities differ</strong>
+          <p>No configuration will be overwritten. Choose another name or reconcile the native entries manually.</p>
+        </div>
+        <div className="comparison-list">
+          {cards.map(({ label, value }) => {
+            const endpoint = value.transport.endpointOrigin
+              ? `${value.transport.endpointOrigin}${value.transport.endpointPath ?? ''}`
+              : undefined;
+            return (
+              <div className="comparison-card" key={`${label}:${value.occurrenceId}`}>
+                <header><span>{label}</span><AgentIcon id={value.agentId} size={15} /></header>
+                <strong>{value.name}</strong>
+                <small>{value.agentId} · {value.transport.kind}</small>
+                {value.transport.commandPreview && <code>{value.transport.commandPreview}</code>}
+                {endpoint && <code>{endpoint}</code>}
+                {value.transport.queryKeys.length > 0 && <p>Query: {value.transport.queryKeys.join(', ')} · values hidden</p>}
+                <div><span>Exact</span><code>{value.identityFingerprint.slice(0, 16)}</code></div>
+                <div><span>Config</span><code>{value.configFingerprint.slice(0, 16)}</code></div>
+                <button type="button" onClick={() => onInspectOccurrence(value.occurrenceId, value.familyFingerprint, value.agentId)}>
+                  Inspect entry <ArrowRight size={11} />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </aside>
+    );
+  }
+
   if (occurrence) {
     const shadowed = snapshot?.occurrences.filter(
       (value) => value.agentId === occurrence.agentId && value.name === occurrence.name && !value.source.effective,
     ).length ?? 0;
-    const missingTargets = AGENT_ORDER.filter(
-      (target) => target !== occurrence.agentId && !row?.occurrences.has(target),
+    const copyTargets = AGENT_ORDER.filter(
+      (target) =>
+        target !== occurrence.agentId &&
+        !snapshot?.occurrences.some(
+          (value) =>
+            value.source.effective &&
+            value.agentId === target &&
+            value.identityFingerprint === occurrence.identityFingerprint,
+        ),
     );
+    const endpoint = occurrence.transport.endpointOrigin
+      ? `${occurrence.transport.endpointOrigin}${occurrence.transport.endpointPath ?? ''}`
+      : undefined;
     return (
       <aside className="inspector-panel">
         <div className="inspector-header">
@@ -590,22 +825,49 @@ function Inspector({
         <InspectorField label="Scope"><code>{occurrence.source.scope}</code>{shadowed > 0 && <small>{shadowed} shadowed layer{shadowed === 1 ? '' : 's'}</small>}</InspectorField>
         <InspectorField label="Source"><code className="path-value">{occurrence.source.path}</code></InspectorField>
         {occurrence.transport.commandPreview && <InspectorField label="Command"><code>{occurrence.transport.commandPreview}</code></InspectorField>}
-        {occurrence.transport.endpointHost && <InspectorField label="Endpoint"><code>{occurrence.transport.endpointHost}</code></InspectorField>}
+        {endpoint && <InspectorField label="Endpoint"><code>{endpoint}</code></InspectorField>}
+        {occurrence.transport.queryKeys.length > 0 && (
+          <InspectorField label="Query shape">
+            <div className="tag-list">{occurrence.transport.queryKeys.map((key) => <span key={key}>{key}</span>)}</div>
+            {occurrence.transport.queryValueFingerprint && <small>Values hidden · equality {occurrence.transport.queryValueFingerprint}</small>}
+          </InspectorField>
+        )}
         {occurrence.transport.envKeys.length > 0 && <InspectorField label="Environment"><div className="tag-list">{occurrence.transport.envKeys.map((key) => <span key={key}>{key}=••••</span>)}</div></InspectorField>}
         {occurrence.transport.headerKeys.length > 0 && <InspectorField label="Headers"><div className="tag-list">{occurrence.transport.headerKeys.map((key) => <span key={key}>{key}: ••••</span>)}</div></InspectorField>}
-        <InspectorField label="Fingerprint"><code>{occurrence.configFingerprint.slice(0, 16)}</code></InspectorField>
+        <InspectorField label="Fingerprints">
+          <div className="fingerprint-list">
+            <span>Family <code>{occurrence.familyFingerprint.slice(0, 16)}</code></span>
+            <span>Exact <code>{occurrence.identityFingerprint.slice(0, 16)}</code></span>
+            <span>Config <code>{occurrence.configFingerprint.slice(0, 16)}</code></span>
+          </div>
+        </InspectorField>
+        {row && row.variants.length > 1 && (
+          <div className="inspector-warning"><GitCompare size={13} /><p>This family has {row.variants.length} exact variants. Copy and conflict checks still use the selected exact identity.</p></div>
+        )}
         {occurrence.warnings.length > 0 && <div className="inspector-warning"><AlertTriangle size={13} /><div>{occurrence.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div></div>}
         <div className="inspector-section copy-section">
           <h3>Copy configuration</h3>
-          <p>Generate a native target config preview. Nothing is written until Apply.</p>
+          <p>Copy this exact variant. Existing names and identities are never overwritten.</p>
           <div className="copy-targets">
-            {missingTargets.map((target) => (
-              <button type="button" key={target} disabled={planning} onClick={() => void onCopy(occurrence.occurrenceId, target)}>
-                <AgentIcon id={target} size={15} /><span>{target}</span><ArrowRight size={12} />
-              </button>
-            ))}
+            {copyTargets.map((target) => {
+              const conflict = targetExactNameConflict(snapshot, target, occurrence);
+              return conflict ? (
+                <button
+                  className="conflict-action"
+                  type="button"
+                  key={target}
+                  onClick={() => onCompare(occurrence.occurrenceId, conflict.occurrenceId, occurrence.familyFingerprint, target)}
+                >
+                  <AgentIcon id={target} size={15} /><span>{target} · compare</span><GitCompare size={12} />
+                </button>
+              ) : (
+                <button type="button" key={target} disabled={planning} onClick={() => void onCopy(occurrence.occurrenceId, target)}>
+                  <AgentIcon id={target} size={15} /><span>{target}</span><ArrowRight size={12} />
+                </button>
+              );
+            })}
           </div>
-          {missingTargets.length === 0 && <p className="copy-complete">Already present in every supported agent.</p>}
+          {copyTargets.length === 0 && <p className="copy-complete">This exact identity is already present in every supported agent.</p>}
         </div>
       </aside>
     );
@@ -616,26 +878,66 @@ function Inspector({
       <aside className="inspector-panel">
         <div className="inspector-header">
           <span className="inspector-icon"><MCP size={18} /></span>
-          <div><h2>{row.displayName}</h2><p>MCP identity</p></div>
+          <div><h2>{row.displayName}</h2><p>MCP family · {row.variants.length} exact {row.variants.length === 1 ? 'variant' : 'variants'}</p></div>
         </div>
         <div className="coverage-strip">
           {AGENT_ORDER.map((agentId) => <i className={row.occurrences.has(agentId) ? 'covered' : ''} key={agentId} />)}
         </div>
         <InspectorField label="Coverage"><strong>{row.occurrences.size} / {AGENT_ORDER.length} agents</strong></InspectorField>
         <InspectorField label="Transport"><code>{row.representative.transport.kind}</code></InspectorField>
-        <InspectorField label="Identity"><code>{row.id.slice(0, 16)}</code></InspectorField>
-        {(row.divergent || row.nameCollision) && (
-          <div className="inspector-warning"><GitCompare size={13} /><p>{row.nameCollision ? 'The same name points to another MCP identity.' : 'Portable options differ between agents.'}</p></div>
+        <InspectorField label="Family"><code>{row.id.slice(0, 16)}</code></InspectorField>
+        {(row.variants.length > 1 || row.divergent || row.nameCollision) && (
+          <div className="inspector-warning">
+            <GitCompare size={13} />
+            <p>
+              {row.nameCollision
+                ? 'The same name is also used by another MCP family.'
+                : row.variants.length > 1
+                  ? 'This family contains multiple exact launch or endpoint variants. They are grouped for navigation, never for overwrite decisions.'
+                  : 'Portable options differ between agents.'}
+            </p>
+          </div>
         )}
         <div className="inspector-section copy-section">
-          <h3>Add missing agents</h3>
-          <p>Click a target to preview its native representation.</p>
-          <div className="copy-targets">
-            {AGENT_ORDER.filter((target) => !row.occurrences.has(target)).map((target) => (
-              <button type="button" key={target} disabled={planning} onClick={() => void onCopy(row.representative.occurrenceId, target)}>
-                <AgentIcon id={target} size={15} /><span>{target}</span><Plus size={12} />
-              </button>
-            ))}
+          <h3>{targetAgentId ? `Choose a variant for ${targetAgentId}` : 'Exact variants'}</h3>
+          <p>{targetAgentId ? 'Select the exact definition to add or compare.' : 'Select a variant to inspect its native definition and distribution options.'}</p>
+          <div className="variant-list">
+            {row.variants.map((variant, index) => {
+              const source = variant.representative;
+              const existing = targetAgentId ? variant.occurrences.get(targetAgentId)?.[0] : undefined;
+              const conflict = targetAgentId
+                ? targetExactNameConflict(snapshot, targetAgentId, source)
+                : undefined;
+              const agents = [...variant.occurrences.keys()].join(', ');
+              return (
+                <div className="variant-card" key={variant.id}>
+                  <button
+                    className="variant-details"
+                    type="button"
+                    onClick={() => onInspectOccurrence(source.occurrenceId, row.id, source.agentId)}
+                  >
+                    <span>Variant {index + 1}</span>
+                    <code>{variant.id.slice(0, 10)}</code>
+                    <small>{agents || source.agentId}</small>
+                  </button>
+                  {targetAgentId && (
+                    existing ? (
+                      <button className="variant-action present" type="button" onClick={() => onInspectOccurrence(existing.occurrenceId, row.id, targetAgentId)}>
+                        <Check size={12} /> Present
+                      </button>
+                    ) : conflict ? (
+                      <button className="variant-action conflict-action" type="button" onClick={() => onCompare(source.occurrenceId, conflict.occurrenceId, row.id, targetAgentId)}>
+                        <GitCompare size={12} /> Compare
+                      </button>
+                    ) : (
+                      <button className="variant-action" type="button" disabled={planning} onClick={() => void onCopy(source.occurrenceId, targetAgentId)}>
+                        <Plus size={12} /> Add
+                      </button>
+                    )
+                  )}
+                </div>
+              );
+            })}
           </div>
         </div>
       </aside>

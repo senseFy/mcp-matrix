@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { access, stat } from 'node:fs/promises';
+import { access, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -181,6 +181,24 @@ async function nearestConfig(
   return undefined;
 }
 
+async function deduplicateConfigSources(sources: NativeConfigSource[]): Promise<NativeConfigSource[]> {
+  const seen = new Set<string>();
+  const output: NativeConfigSource[] = [];
+  for (const source of sources) {
+    let physicalPath: string;
+    try {
+      physicalPath = await realpath(source.path);
+    } catch {
+      physicalPath = resolve(source.path);
+    }
+    const key = [source.agentId, physicalPath, source.selector ?? '', source.projectKey ?? ''].join('\0');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(source);
+  }
+  return output;
+}
+
 export async function discoverConfigSources(workspaceInput: string): Promise<NativeConfigSource[]> {
   const workspace = resolve(workspaceInput);
   const repositoryRoot = await findRepositoryRoot(workspace);
@@ -304,5 +322,5 @@ export async function discoverConfigSources(workspaceInput: string): Promise<Nat
     });
   }
 
-  return sources;
+  return deduplicateConfigSources(sources);
 }

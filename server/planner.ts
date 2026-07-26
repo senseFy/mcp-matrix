@@ -24,8 +24,12 @@ interface InternalPlan extends ChangePlan {
   originalContent: string;
   proposedContent: string;
   originalExists: boolean;
-  sourcePath: string;
-  sourceHash: string;
+  workspace: string;
+  sourceAgentId: AgentId;
+  sourceName: string;
+  sourceIdentityFingerprint: string;
+  sourceConfigFingerprint: string;
+  sourceRevisions: Array<{ path: string; hash: string }>;
   createdAt: number;
 }
 
@@ -44,7 +48,19 @@ const plans = new Map<string, InternalPlan>();
 const PLAN_LIFETIME_MS = 10 * 60 * 1_000;
 
 function publicPlan(plan: InternalPlan): ChangePlan {
-  const { originalContent: _original, proposedContent: _proposed, originalExists: _exists, sourcePath: _path, sourceHash: _hash, createdAt: _createdAt, ...response } = plan;
+  const {
+    originalContent: _original,
+    proposedContent: _proposed,
+    originalExists: _exists,
+    workspace: _workspace,
+    sourceAgentId: _sourceAgentId,
+    sourceName: _sourceName,
+    sourceIdentityFingerprint: _sourceIdentityFingerprint,
+    sourceConfigFingerprint: _sourceConfigFingerprint,
+    sourceRevisions: _sourceRevisions,
+    createdAt: _createdAt,
+    ...response
+  } = plan;
   return response;
 }
 
@@ -227,8 +243,12 @@ export async function createCopyPlan(input: {
     originalContent,
     proposedContent,
     originalExists,
-    sourcePath: source.source.path,
-    sourceHash: source.source.hash,
+    workspace: input.workspace,
+    sourceAgentId: source.agentId,
+    sourceName: source.name,
+    sourceIdentityFingerprint: source.identityFingerprint,
+    sourceConfigFingerprint: source.configFingerprint,
+    sourceRevisions: source.sourceRevisions,
     createdAt: Date.now(),
   };
   plans.set(planId, plan);
@@ -317,9 +337,38 @@ export async function applyPlan(planId: string): Promise<ApplyResult> {
   if (currentTargetHash !== expectedTargetHash) {
     throw new Error('The target configuration changed after this preview. Refresh before applying.');
   }
-  const currentSourceHash = await readHash(plan.sourcePath);
-  if (currentSourceHash !== plan.sourceHash) {
-    throw new Error('The source configuration changed after this preview. Refresh before applying.');
+  for (const revision of plan.sourceRevisions) {
+    if ((await readHash(revision.path)) !== revision.hash) {
+      throw new Error('The source configuration changed after this preview. Refresh before applying.');
+    }
+  }
+  const currentSnapshot = await loadNativeSnapshot(plan.workspace);
+  const identicalTarget = currentSnapshot.occurrences.find(
+    (occurrence) =>
+      occurrence.source.effective &&
+      occurrence.agentId === plan.targetAgentId &&
+      occurrence.identityFingerprint === plan.sourceIdentityFingerprint,
+  );
+  if (identicalTarget) {
+    throw new Error('The target effective configuration gained this MCP identity after the preview. Refresh before applying.');
+  }
+  const conflictingTarget = currentSnapshot.occurrences.find(
+    (occurrence) =>
+      occurrence.source.effective &&
+      occurrence.agentId === plan.targetAgentId &&
+      occurrence.name === plan.targetName,
+  );
+  if (conflictingTarget) {
+    throw new Error(`The target effective configuration gained "${plan.targetName}" after the preview. Refresh before applying.`);
+  }
+  const currentSource = currentSnapshot.occurrences.find(
+    (occurrence) =>
+      occurrence.source.effective &&
+      occurrence.agentId === plan.sourceAgentId &&
+      occurrence.name === plan.sourceName,
+  );
+  if (!currentSource || currentSource.configFingerprint !== plan.sourceConfigFingerprint) {
+    throw new Error('The effective source configuration changed after this preview. Refresh before applying.');
   }
 
   const manifest = await createUndoManifest(plan);

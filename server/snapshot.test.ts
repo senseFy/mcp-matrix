@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -108,6 +108,43 @@ describe('native discovery and normalization', () => {
       source: { scope: 'project', path: join(workspace, '.codex', 'config.toml') },
     });
     expect(codex?.warnings.join(' ')).toContain('merges 2 Codex TOML');
+    expect(codex?.sourceRevisions).toHaveLength(2);
+  });
+
+  it('does not treat the Codex user file as a project layer when the workspace is HOME', async () => {
+    await mkdir(join(home, '.git'), { recursive: true });
+    await mkdir(join(home, '.codex'), { recursive: true });
+    await writeFile(
+      join(home, '.codex', 'config.toml'),
+      '[mcp_servers.codex]\ncommand = "codex-command"\n',
+    );
+
+    const snapshot = await loadNativeSnapshot(home);
+    const codexSources = snapshot.sources.filter((source) => source.agentId === 'codex');
+    const codex = snapshot.occurrences.find(
+      (entry) => entry.agentId === 'codex' && entry.name === 'codex' && entry.source.effective,
+    );
+
+    expect(codexSources).toHaveLength(1);
+    expect(codexSources[0].scope).toBe('user');
+    expect(codex?.source.scope).toBe('user');
+    expect(codex?.warnings.join(' ')).not.toContain('merges');
+  });
+
+  it('deduplicates Codex config layers that resolve to the same physical file', async () => {
+    await mkdir(join(home, '.codex'), { recursive: true });
+    await writeFile(
+      join(home, '.codex', 'config.toml'),
+      '[mcp_servers.codex]\ncommand = "codex-command"\n',
+    );
+    await mkdir(join(workspace, '.codex'), { recursive: true });
+    await symlink(join(home, '.codex', 'config.toml'), join(workspace, '.codex', 'config.toml'));
+
+    const snapshot = await loadNativeSnapshot(workspace);
+    const codexSources = snapshot.sources.filter((source) => source.agentId === 'codex');
+
+    expect(codexSources).toHaveLength(1);
+    expect(codexSources[0].scope).toBe('user');
   });
 
   it('marks a Claude remote entry without an explicit type as invalid', async () => {

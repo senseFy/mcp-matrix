@@ -56,6 +56,16 @@ npm run dev
 
 The workspace field controls which project-scoped config layers are discovered. User-level config is always included.
 
+## How MCP identities are grouped
+
+MCP Matrix keeps three deliberately separate fingerprints:
+
+- **Family** groups related definitions for navigation, such as GitKraken client-specific launch arguments or Supabase project endpoints.
+- **Exact identity** represents the complete command plus arguments, or the complete remote URL. Copy, duplicate, and name-conflict checks always use this level.
+- **Config** also includes portable options such as environment keys, headers, enabled state, timeouts, and tool filters.
+
+A family can therefore contain multiple exact variants. MCP Matrix shows them together so the relationship is visible, but never assumes that variants are interchangeable and never overwrites one with another. Remote query values remain hidden; only parameter names and a process-local equality fingerprint are shown.
+
 ## Checks
 
 ```bash

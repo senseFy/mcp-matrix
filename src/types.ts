@@ -7,7 +7,10 @@ export type ConfigScope = 'user' | 'local' | 'project' | 'folder' | 'workspace';
 export interface PublicTransport {
   kind: TransportKind;
   commandPreview?: string;
-  endpointHost?: string;
+  endpointOrigin?: string;
+  endpointPath?: string;
+  queryKeys: string[];
+  queryValueFingerprint?: string;
   envKeys: string[];
   headerKeys: string[];
 }
@@ -29,6 +32,7 @@ export interface PublicMcpOccurrence {
   timeoutMs?: number;
   includeTools?: string[];
   excludeTools?: string[];
+  familyFingerprint: string;
   identityFingerprint: string;
   configFingerprint: string;
   source: ConfigSource;

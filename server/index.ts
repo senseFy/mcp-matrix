@@ -11,7 +11,7 @@ import { AGENTS, toPublicOccurrence } from './domain';
 import { detectAgents } from './discovery';
 import { applyPlan, createCopyPlan, undoApply } from './planner';
 
-const HOST = process.env.MCP_MATRIX_HOST ?? '127.0.0.1';
+const HOST = '127.0.0.1';
 const PORT = Number(process.env.PORT ?? 4318);
 const development = process.env.NODE_ENV !== 'production';
 const agentIds = new Set<AgentId>(AGENTS.map((agent) => agent.id));
@@ -203,9 +203,30 @@ async function start(): Promise<void> {
     }
   });
 
-  server.listen(PORT, HOST, () => {
-    console.log(`MCP Matrix is running at http://${HOST}:${PORT}`);
-  });
+  try {
+    await new Promise<void>((resolveListen, rejectListen) => {
+      const onError = (error: Error) => rejectListen(error);
+      server.once('error', onError);
+      server.listen(PORT, HOST, () => {
+        server.off('error', onError);
+        console.log(`MCP Matrix is running at http://${HOST}:${PORT}`);
+        resolveListen();
+      });
+    });
+  } catch (error) {
+    await vite?.close();
+    throw error;
+  }
 }
 
-void start();
+void start().catch((error: NodeJS.ErrnoException) => {
+  const suggestedPort = PORT < 65_535 ? PORT + 1 : 4318;
+  const message =
+    error.code === 'EADDRINUSE'
+      ? `Port ${PORT} is already in use. Try: mcp-matrix --port ${suggestedPort}`
+      : error.code === 'EACCES'
+        ? `Permission denied while binding to loopback port ${PORT}.`
+        : error.message || 'Unable to start the local server.';
+  console.error(`mcp-matrix: ${message}`);
+  process.exitCode = 1;
+});

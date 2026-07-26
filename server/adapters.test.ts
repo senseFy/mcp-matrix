@@ -28,6 +28,7 @@ function occurrence(
       effective: true,
       precedence: 100,
     },
+    sourceRevisions: [{ path: '/tmp/source', hash: 'hash' }],
     warnings: [],
     native,
   };

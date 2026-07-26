@@ -9,6 +9,7 @@ import {
   buildOccurrenceId,
   looksLikeLiteralSecret,
   parsePureEnvironmentReference,
+  redactConfigContent,
   sha256,
   type RawMcpOccurrence,
   type RawTransport,
@@ -136,7 +137,7 @@ function normalizeJsonSpec(
         : undefined;
   const excludeTools = agentId === 'droid' ? asStringArray(spec.disabledTools) : undefined;
   const portable = { transport, enabled, timeoutMs, includeTools, excludeTools };
-  const fingerprints = buildFingerprints(transport, portable);
+  const fingerprints = buildFingerprints(transport, portable, name);
 
   return {
     occurrenceId: buildOccurrenceId(agentId, source.path, source.scope, name),
@@ -155,6 +156,7 @@ function normalizeJsonSpec(
       effective: false,
       precedence: source.precedence,
     },
+    sourceRevisions: [{ path: source.path, hash: fileHash }],
     warnings,
     native: spec,
   };
@@ -188,7 +190,7 @@ function normalizeOpenCodeSpec(
     warnings.push('OpenCode timeout controls initial tool discovery and is not a portable tool-call timeout.');
   }
   const portable = { transport, enabled };
-  const fingerprints = buildFingerprints(transport, portable);
+  const fingerprints = buildFingerprints(transport, portable, name);
 
   return {
     occurrenceId: buildOccurrenceId('opencode', source.path, source.scope, name),
@@ -205,6 +207,7 @@ function normalizeOpenCodeSpec(
       effective: false,
       precedence: source.precedence,
     },
+    sourceRevisions: [{ path: source.path, hash: fileHash }],
     warnings,
     native: spec,
   };
@@ -260,7 +263,7 @@ function normalizeCodexSpec(
   const excludeTools = asStringArray(spec.disabled_tools);
   const enabled = asBoolean(spec.enabled) !== false;
   const portable = { transport, enabled, timeoutMs, includeTools, excludeTools };
-  const fingerprints = buildFingerprints(transport, portable);
+  const fingerprints = buildFingerprints(transport, portable, name);
 
   return {
     occurrenceId: buildOccurrenceId('codex', source.path, source.scope, name),
@@ -279,6 +282,7 @@ function normalizeCodexSpec(
       effective: false,
       precedence: source.precedence,
     },
+    sourceRevisions: [{ path: source.path, hash: fileHash }],
     warnings,
     native: spec,
   };
@@ -306,7 +310,9 @@ async function parseSource(
       issue: {
         agentId: source.agentId,
         path: source.path,
-        message: error instanceof Error ? error.message : 'Unable to read configuration.',
+        message: redactConfigContent(
+          error instanceof Error ? error.message : 'Unable to read configuration.',
+        ),
       },
     };
   }
@@ -327,7 +333,9 @@ async function parseSource(
         issue: {
           agentId: source.agentId,
           path: source.path,
-          message: error instanceof Error ? error.message : 'Unable to parse TOML configuration.',
+          message: redactConfigContent(
+            error instanceof Error ? error.message : 'Unable to parse TOML configuration.',
+          ),
         },
       };
     }
@@ -424,6 +432,13 @@ function mergeLayeredOccurrences(occurrences: RawMcpOccurrence[]): RawMcpOccurre
       highest.agentId === 'opencode'
         ? normalizeOpenCodeSpec(source, highest.name, merged, highest.source.hash)
         : normalizeCodexSpec(source, highest.name, merged, highest.source.hash);
+    normalized.sourceRevisions = [
+      ...new Map(
+        values
+          .flatMap((occurrence) => occurrence.sourceRevisions)
+          .map((revision) => [revision.path, revision]),
+      ).values(),
+    ];
     normalized.warnings.unshift(
       `Effective entry merges ${values.length} ${
         highest.agentId === 'opencode' ? 'OpenCode JSON' : 'Codex TOML'

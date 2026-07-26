@@ -101,4 +101,65 @@ describe('safe write workflow', () => {
     await expect(applyPlan(plan.planId)).rejects.toThrow('changed after this preview');
     expect(await readFile(targetPath, 'utf8')).toBe(externalEdit);
   });
+
+  it('refuses a plan when any contributing source layer changes', async () => {
+    const codexUser = join(home, '.codex', 'config.toml');
+    const codexProject = join(workspace, '.codex', 'config.toml');
+    await mkdir(join(codexUser, '..'), { recursive: true });
+    await mkdir(join(codexProject, '..'), { recursive: true });
+    await writeFile(codexUser, '[mcp_servers.layered]\ncommand = "node"\nargs = ["server.js"]\n');
+    await writeFile(codexProject, '[mcp_servers.layered]\nenabled = true\n');
+    const snapshot = await loadNativeSnapshot(workspace);
+    const source = snapshot.occurrences.find(
+      (entry) => entry.agentId === 'codex' && entry.name === 'layered' && entry.source.effective,
+    )!;
+    const plan = await createCopyPlan({
+      workspace,
+      occurrenceId: source.occurrenceId,
+      targetAgentId: 'claude',
+    });
+
+    await writeFile(codexUser, '[mcp_servers.layered]\ncommand = "node"\nargs = ["changed.js"]\n');
+
+    await expect(applyPlan(plan.planId)).rejects.toThrow('source configuration changed');
+  });
+
+  it('refuses a plan when a newly discovered layer changes the effective source', async () => {
+    const codexUser = join(home, '.codex', 'config.toml');
+    await mkdir(join(codexUser, '..'), { recursive: true });
+    await writeFile(codexUser, '[mcp_servers.layered]\ncommand = "node"\nargs = ["server.js"]\n');
+    const snapshot = await loadNativeSnapshot(workspace);
+    const source = snapshot.occurrences.find(
+      (entry) => entry.agentId === 'codex' && entry.name === 'layered' && entry.source.effective,
+    )!;
+    const plan = await createCopyPlan({
+      workspace,
+      occurrenceId: source.occurrenceId,
+      targetAgentId: 'claude',
+    });
+    const codexProject = join(workspace, '.codex', 'config.toml');
+    await mkdir(join(codexProject, '..'), { recursive: true });
+    await writeFile(codexProject, '[mcp_servers.layered]\nenabled = false\n');
+
+    await expect(applyPlan(plan.planId)).rejects.toThrow('effective source configuration changed');
+  });
+
+  it('refuses a plan when another target layer gains a name conflict', async () => {
+    const plan = await createCopyPlan({
+      workspace,
+      occurrenceId: await sourceOccurrenceId(),
+      targetAgentId: 'amp',
+    });
+    const workspaceTarget = join(workspace, '.amp', 'settings.json');
+    await mkdir(join(workspaceTarget, '..'), { recursive: true });
+    await writeFile(
+      workspaceTarget,
+      `${JSON.stringify({
+        'amp.mcpServers': { portable: { command: 'another-command' } },
+      })}\n`,
+    );
+
+    await expect(applyPlan(plan.planId)).rejects.toThrow('target effective configuration gained');
+    expect(await readFile(targetPath, 'utf8')).toBe(targetBefore);
+  });
 });

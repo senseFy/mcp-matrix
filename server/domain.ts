@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
+import { basename } from 'node:path';
 
 import type {
   AgentDefinition,
@@ -66,6 +67,7 @@ export interface RawMcpOccurrence {
   timeoutMs?: number;
   includeTools?: string[];
   excludeTools?: string[];
+  familyFingerprint: string;
   identityFingerprint: string;
   configFingerprint: string;
   source: {
@@ -75,6 +77,10 @@ export interface RawMcpOccurrence {
     effective: boolean;
     precedence: number;
   };
+  sourceRevisions: Array<{
+    path: string;
+    hash: string;
+  }>;
   warnings: string[];
   native: Record<string, unknown>;
 }
@@ -99,7 +105,109 @@ export function stableStringify(value: unknown): string {
   return JSON.stringify(stableObject(value));
 }
 
-export function buildFingerprints(transport: RawTransport, portable: unknown) {
+function packageWithoutVersion(value: string): string {
+  if (value.startsWith('@')) {
+    const separator = value.lastIndexOf('@');
+    return separator > value.indexOf('/') ? value.slice(0, separator) : value;
+  }
+  const separator = value.lastIndexOf('@');
+  return separator > 0 ? value.slice(0, separator) : value;
+}
+
+function firstRunnerPackage(args: string[]): string | undefined {
+  const optionsWithValues = new Set([
+    '--cache',
+    '--call',
+    '--node-options',
+    '--registry',
+    '--userconfig',
+    '-c',
+  ]);
+  const optionsWithoutValues = new Set([
+    '--ignore-existing',
+    '--no-install',
+    '--quiet',
+    '--refresh',
+    '--yes',
+    '-q',
+    '-y',
+  ]);
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index];
+    if (value === '--') return args[index + 1];
+    if (/^(?:--package|-p)$/.test(value)) return args[index + 1];
+    const inlinePackage = value.match(/^--package=(.+)$/)?.[1];
+    if (inlinePackage) return inlinePackage;
+    if (optionsWithValues.has(value)) {
+      index += 1;
+      continue;
+    }
+    if (optionsWithoutValues.has(value)) continue;
+    if (value.startsWith('-')) return undefined;
+    return value;
+  }
+  return undefined;
+}
+
+function stdioFamily(transport: RawTransport): unknown {
+  const command = canonicalizeReferences(transport.command ?? '');
+  const args = transport.args ?? [];
+  const executable = basename(transport.command ?? '').toLocaleLowerCase().replace(/\.exe$/, '');
+  let packageName: string | undefined;
+
+  if (['npx', 'bunx', 'pnpx', 'uvx'].includes(executable)) {
+    packageName = firstRunnerPackage(args);
+  } else if (executable === 'npm' && ['exec', 'x'].includes(args[0])) {
+    packageName = firstRunnerPackage(args.slice(1));
+  } else if (executable === 'yarn' && args[0] === 'dlx') {
+    packageName = firstRunnerPackage(args.slice(1));
+  } else if (executable === 'pipx' && args[0] === 'run') {
+    packageName = firstRunnerPackage(args.slice(1));
+  }
+
+  if (packageName) {
+    return {
+      kind: 'stdio',
+      package: packageWithoutVersion(packageName.toLocaleLowerCase()),
+    };
+  }
+
+  if (['node', 'nodejs', 'python', 'python3', 'ruby'].includes(executable)) {
+    return {
+      kind: 'stdio',
+      runtime: executable.replace(/\d+$/, ''),
+      positionalArgs: args
+        .filter((value) => !value.startsWith('-'))
+        .map((value) => canonicalizeReferences(value)),
+    };
+  }
+
+  return {
+    kind: 'stdio',
+    command,
+    positionalArgs: args
+      .filter((value) => !value.startsWith('-'))
+      .map((value) => canonicalizeReferences(value)),
+  };
+}
+
+function remoteFamily(transport: RawTransport): unknown {
+  try {
+    const endpoint = new URL(transport.url ?? '');
+    return {
+      kind: 'remote',
+      origin: endpoint.origin.toLocaleLowerCase(),
+      path: endpoint.pathname,
+    };
+  } catch {
+    return {
+      kind: 'remote',
+      endpoint: canonicalizeReferences((transport.url ?? '').replace(/[?#].*$/, '')),
+    };
+  }
+}
+
+export function buildFingerprints(transport: RawTransport, portable: unknown, familyName?: string) {
   const identity =
     transport.kind === 'stdio'
       ? {
@@ -112,7 +220,16 @@ export function buildFingerprints(transport: RawTransport, portable: unknown) {
           url: transport.url,
         };
 
+  const family = transport.kind === 'stdio'
+    ? stdioFamily(transport)
+    : transport.url
+      ? remoteFamily(transport)
+      : { kind: 'unknown', name: familyName?.trim().toLocaleLowerCase() ?? '' };
+
   return {
+    familyFingerprint: sha256(
+      stableStringify(family),
+    ).slice(0, 20),
     identityFingerprint: sha256(stableStringify(canonicalizeReferences(identity))).slice(0, 20),
     configFingerprint: sha256(stableStringify(canonicalizeReferences(portable))).slice(0, 20),
   };
@@ -153,6 +270,7 @@ const referencePatterns = [
 
 const sensitiveKeyPattern =
   /(?:^|[_-])(token|secret|password|passwd|api[_-]?key|authorization|cookie|credential|private[_-]?key)(?:$|[_-])/i;
+const publicFingerprintKey = randomBytes(32);
 
 export interface EnvironmentReference {
   name: string;
@@ -197,18 +315,66 @@ function redactArgs(args: string[]): { args: string[]; sensitive: boolean } {
   return { args: redacted, sensitive };
 }
 
+function redactEndpointPath(pathname: string): string {
+  const segments = pathname.split('/');
+  return segments
+    .map((segment, index) => {
+      let decoded = segment;
+      try {
+        decoded = decodeURIComponent(segment);
+      } catch {
+        // Keep malformed percent encoding for the generic value check.
+      }
+      const previous = segments[index - 1] ?? '';
+      return sensitiveKeyPattern.test(`_${previous}_`) ||
+        looksSensitiveValue(decoded) ||
+        looksLikeOpaqueIdentifier(decoded)
+        ? '••••••••'
+        : segment;
+    })
+    .join('/');
+}
+
+function looksLikeOpaqueIdentifier(value: string): boolean {
+  return (
+    value.length >= 16 &&
+    /^[A-Za-z0-9_-]+$/.test(value) &&
+    /[A-Za-z]/.test(value) &&
+    /\d/.test(value)
+  );
+}
+
 export function toPublicOccurrence(occurrence: RawMcpOccurrence): PublicMcpOccurrence {
   const args = redactArgs(occurrence.transport.args ?? []);
   const commandPreview = occurrence.transport.command
     ? [occurrence.transport.command, ...args.args].join(' ')
     : undefined;
-  let endpointHost: string | undefined;
+  let endpointOrigin: string | undefined;
+  let endpointPath: string | undefined;
+  let queryKeys: string[] = [];
+  let queryValueFingerprint: string | undefined;
   if (occurrence.transport.url) {
     try {
       const endpoint = new URL(occurrence.transport.url);
-      endpointHost = `${endpoint.protocol}//${endpoint.host}`;
+      endpointOrigin = endpoint.origin;
+      endpointPath = redactEndpointPath(endpoint.pathname);
+      queryKeys = [...new Set(
+        [...endpoint.searchParams.keys()].map((key) =>
+          sensitiveKeyPattern.test(`_${key}_`) ||
+          looksSensitiveValue(key) ||
+          looksLikeOpaqueIdentifier(key)
+            ? 'sensitive parameter'
+            : key,
+        ),
+      )].sort();
+      if (endpoint.search) {
+        queryValueFingerprint = createHmac('sha256', publicFingerprintKey)
+          .update(endpoint.search)
+          .digest('hex')
+          .slice(0, 16);
+      }
     } catch {
-      endpointHost = /\$\{|\{env:|\{file:/.test(occurrence.transport.url)
+      endpointOrigin = /\$\{|\{env:|\{file:/.test(occurrence.transport.url)
         ? 'Templated endpoint'
         : 'Invalid endpoint';
     }
@@ -217,7 +383,10 @@ export function toPublicOccurrence(occurrence: RawMcpOccurrence): PublicMcpOccur
   const transport: PublicTransport = {
     kind: occurrence.transport.kind,
     commandPreview,
-    endpointHost,
+    endpointOrigin,
+    endpointPath,
+    queryKeys,
+    queryValueFingerprint,
     envKeys: Object.keys(occurrence.transport.env ?? {}).sort(),
     headerKeys: Object.keys(occurrence.transport.headers ?? {}).sort(),
   };
@@ -231,6 +400,7 @@ export function toPublicOccurrence(occurrence: RawMcpOccurrence): PublicMcpOccur
     timeoutMs: occurrence.timeoutMs,
     includeTools: occurrence.includeTools,
     excludeTools: occurrence.excludeTools,
+    familyFingerprint: occurrence.familyFingerprint,
     identityFingerprint: occurrence.identityFingerprint,
     configFingerprint: occurrence.configFingerprint,
     source: occurrence.source,
