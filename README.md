@@ -28,9 +28,24 @@ MCP Matrix is deliberately **not** an MCP proxy, gateway, registry, or runtime.
 
 See [the official-client compatibility notes](docs/official-client-matrix.md) for the exact native formats and documented limitations.
 
-## Run locally
+## Install
 
 Requires Node.js 20.19 or newer.
+
+```bash
+npm install --global @sensef/mcp-matrix
+mcp-matrix
+```
+
+Open <http://127.0.0.1:4318>. Run the command from the project whose scoped MCP configuration you want to inspect. Use `mcp-matrix --port 4400` when the default port is occupied.
+
+You can also run it without a global install:
+
+```bash
+npx @sensef/mcp-matrix
+```
+
+## Develop from source
 
 ```bash
 git clone https://github.com/senseFy/mcp-matrix.git
@@ -39,7 +54,7 @@ npm install
 npm run dev
 ```
 
-Open <http://127.0.0.1:4318>. The workspace field controls which project-scoped config layers are discovered. User-level config is always included.
+The workspace field controls which project-scoped config layers are discovered. User-level config is always included.
 
 ## Checks
 
