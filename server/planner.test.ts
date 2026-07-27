@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { loadNativeSnapshot } from './adapters';
-import { applyPlan, createCopyPlan, undoApply } from './planner';
+import { applyPlan, createAuthPlan, createCopyPlan, undoApply } from './planner';
 
 let root: string;
 let home: string;
@@ -32,6 +32,15 @@ beforeEach(async () => {
           command: 'npx',
           args: ['-y', '@example/server'],
           env: { SERVICE_MODE: 'literal-private-setting-that-must-not-leak' },
+        },
+        revenuecat: {
+          type: 'http',
+          url: 'https://mcp.revenuecat.ai/mcp',
+        },
+        unsafe: {
+          type: 'http',
+          url: 'https://mcp.example.com/mcp',
+          headers: { Authorization: 'sk-live-literal-credential${TOKEN_SUFFIX}' },
         },
       },
     }, null, 2)}\n`,
@@ -161,5 +170,57 @@ describe('safe write workflow', () => {
 
     await expect(applyPlan(plan.planId)).rejects.toThrow('target effective configuration gained');
     expect(await readFile(targetPath, 'utf8')).toBe(targetBefore);
+  });
+
+  it('reconciles a URL-only Droid server to a generic environment-backed bearer strategy', async () => {
+    const snapshot = await loadNativeSnapshot(workspace);
+    const revenuecat = snapshot.occurrences.find(
+      (entry) => entry.agentId === 'droid' && entry.name === 'revenuecat' && entry.source.effective,
+    )!;
+    const before = await readFile(sourcePath, 'utf8');
+    const plan = await createAuthPlan({
+      workspace,
+      occurrenceId: revenuecat.occurrenceId,
+      auth: {
+        kind: 'bearer-environment',
+        environmentVariable: 'REVENUECAT_API_V2_SECRET_KEY',
+      },
+    });
+
+    expect(plan.operation).toBe('configure-auth');
+    expect(plan.unifiedDiff).toContain('REVENUECAT_API_V2_SECRET_KEY');
+    expect(plan.unifiedDiff).toContain('Bearer ${REVENUECAT_API_V2_SECRET_KEY}');
+    expect(plan.unifiedDiff).toContain('"oauth": false');
+    expect(await readFile(sourcePath, 'utf8')).toBe(before);
+
+    const applied = await applyPlan(plan.planId);
+    const configured = JSON.parse(await readFile(sourcePath, 'utf8')) as {
+      mcpServers: Record<string, Record<string, unknown>>;
+    };
+    expect(configured.mcpServers.revenuecat).toMatchObject({
+      type: 'http',
+      url: 'https://mcp.revenuecat.ai/mcp',
+      oauth: false,
+      headers: { Authorization: 'Bearer ${REVENUECAT_API_V2_SECRET_KEY}' },
+    });
+    expect(configured.mcpServers.portable).toBeDefined();
+
+    await undoApply(applied.undoToken);
+    expect(await readFile(sourcePath, 'utf8')).toBe(before);
+  });
+
+  it('masks a literal prefix even when a credential header ends in an environment reference', async () => {
+    const snapshot = await loadNativeSnapshot(workspace);
+    const unsafe = snapshot.occurrences.find(
+      (entry) => entry.agentId === 'droid' && entry.name === 'unsafe' && entry.source.effective,
+    )!;
+    const plan = await createAuthPlan({
+      workspace,
+      occurrenceId: unsafe.occurrenceId,
+      auth: { kind: 'oauth-disabled' },
+    });
+
+    expect(plan.unifiedDiff).not.toContain('sk-live-literal-credential');
+    expect(plan.unifiedDiff).toContain('••••••••');
   });
 });

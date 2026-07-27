@@ -15,9 +15,15 @@ import {
 import { basename, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 
-import type { AgentId, ApplyResult, ChangePlan, UndoResult } from '../src/types';
-import { addServerToContent, loadNativeSnapshot, serializeForAgent } from './adapters';
-import { maskSecretPatterns, sha256 } from './domain';
+import type { AgentId, ApplyResult, AuthUpdate, ChangePlan, UndoResult } from '../src/types';
+import {
+  addServerToContent,
+  loadNativeSnapshot,
+  nativeSpecWithAuthUpdate,
+  serializeForAgent,
+  updateAuthInContent,
+} from './adapters';
+import { looksLikeLiteralSecret, maskSecretPatterns, sha256 } from './domain';
 import type { NativeConfigSource } from './discovery';
 
 interface InternalPlan extends ChangePlan {
@@ -114,10 +120,21 @@ function redactNativeSpec(value: unknown, parentKey = ''): unknown {
   if (Array.isArray(value)) return value.map((entry) => redactNativeSpec(entry, parentKey));
   if (value && typeof value === 'object') {
     const sensitiveContainer = /^(env|environment|headers|http_headers)$/i.test(parentKey);
+    const environmentHeaderContainer = /^env_http_headers$/i.test(parentKey);
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>).map(([key, entry]) => {
+        if (
+          (environmentHeaderContainer || key === 'bearer_token_env_var') &&
+          typeof entry === 'string' &&
+          /^[A-Za-z_][A-Za-z0-9_]*$/.test(entry)
+        ) {
+          return [key, entry];
+        }
         if (sensitiveContainer) {
-          const isReference = typeof entry === 'string' && /^(?:\$\{[A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?\}|\{env:[A-Za-z_][A-Za-z0-9_]*\})$/.test(entry);
+          const reference = typeof entry === 'string'
+            ? entry.match(/^([^{}$\r\n]{0,64})(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\{env:[A-Za-z_][A-Za-z0-9_]*\})$/)
+            : undefined;
+          const isReference = Boolean(reference && !looksLikeLiteralSecret('', reference[1]));
           return [key, isReference ? entry : '••••••••'];
         }
         if (key === 'url' && typeof entry === 'string') {
@@ -169,6 +186,35 @@ function focusedDiff(agentId: AgentId, targetPath: string, name: string, spec: R
     `+++ ${targetPath}`,
     `@@ add MCP server "${name}" (${agentId}) @@`,
     ...lines.map((line) => `+${line}`),
+  ].join('\n');
+}
+
+function authPreviewSpec(agentId: AgentId, spec: Record<string, unknown>): Record<string, unknown> {
+  const keys = agentId === 'codex'
+    ? ['bearer_token_env_var', 'http_headers', 'env_http_headers', 'auth', 'scopes', 'oauth_resource']
+    : ['headers', 'oauth'];
+  return Object.fromEntries(keys.flatMap((key) => spec[key] === undefined ? [] : [[key, spec[key]]]));
+}
+
+function focusedAuthDiff(
+  agentId: AgentId,
+  targetPath: string,
+  name: string,
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+): string {
+  const previous = redactNativeSpec(authPreviewSpec(agentId, before)) as Record<string, unknown>;
+  const next = redactNativeSpec(authPreviewSpec(agentId, after)) as Record<string, unknown>;
+  const render = (value: Record<string, unknown>): string[] =>
+    agentId === 'codex'
+      ? Object.entries(value).map(([key, entry]) => `${key} = ${previewTomlValue(entry)}`)
+      : JSON.stringify(value, null, 2).split('\n');
+  return [
+    `--- ${targetPath}`,
+    `+++ ${targetPath}`,
+    `@@ configure authentication for MCP server "${name}" (${agentId}) @@`,
+    ...render(previous).map((line) => `-${line}`),
+    ...render(next).map((line) => `+${line}`),
   ].join('\n');
 }
 
@@ -232,6 +278,7 @@ export async function createCopyPlan(input: {
   const planId = randomUUID();
   const plan: InternalPlan = {
     planId,
+    operation: 'add',
     occurrenceId: source.occurrenceId,
     targetAgentId: input.targetAgentId,
     targetName,
@@ -249,6 +296,63 @@ export async function createCopyPlan(input: {
     sourceIdentityFingerprint: source.identityFingerprint,
     sourceConfigFingerprint: source.configFingerprint,
     sourceRevisions: source.sourceRevisions,
+    createdAt: Date.now(),
+  };
+  plans.set(planId, plan);
+  return publicPlan(plan);
+}
+
+export async function createAuthPlan(input: {
+  workspace: string;
+  occurrenceId: string;
+  auth: AuthUpdate;
+}): Promise<ChangePlan> {
+  clearExpiredPlans();
+  const snapshot = await loadNativeSnapshot(input.workspace);
+  const occurrence = snapshot.occurrences.find(
+    (entry) => entry.occurrenceId === input.occurrenceId && entry.source.effective,
+  );
+  if (!occurrence) throw new Error('The effective MCP entry no longer exists. Refresh and try again.');
+  const serialized = nativeSpecWithAuthUpdate(occurrence, input.auth);
+  if (!serialized.spec || serialized.errors.length) {
+    throw new Error(serialized.errors.join(' ') || 'This authentication strategy cannot be represented by the target agent.');
+  }
+  const targetPath = await resolveWritePath(occurrence.source.path);
+  const originalContent = await readFile(targetPath, 'utf8');
+  const proposedContent = updateAuthInContent(
+    occurrence.agentId,
+    originalContent,
+    occurrence,
+    serialized.spec,
+  );
+  if (proposedContent === originalContent) throw new Error('The requested authentication configuration is already present.');
+  const planId = randomUUID();
+  const plan: InternalPlan = {
+    planId,
+    operation: 'configure-auth',
+    occurrenceId: occurrence.occurrenceId,
+    targetAgentId: occurrence.agentId,
+    targetName: occurrence.name,
+    targetPath,
+    expectedHash: sha256(originalContent),
+    resultHash: sha256(proposedContent),
+    warnings: [...new Set([...occurrence.warnings, ...serialized.warnings])],
+    unifiedDiff: focusedAuthDiff(
+      occurrence.agentId,
+      targetPath,
+      occurrence.name,
+      occurrence.native,
+      serialized.spec,
+    ),
+    originalContent,
+    proposedContent,
+    originalExists: true,
+    workspace: input.workspace,
+    sourceAgentId: occurrence.agentId,
+    sourceName: occurrence.name,
+    sourceIdentityFingerprint: occurrence.identityFingerprint,
+    sourceConfigFingerprint: occurrence.configFingerprint,
+    sourceRevisions: occurrence.sourceRevisions,
     createdAt: Date.now(),
   };
   plans.set(planId, plan);
@@ -343,23 +447,25 @@ export async function applyPlan(planId: string): Promise<ApplyResult> {
     }
   }
   const currentSnapshot = await loadNativeSnapshot(plan.workspace);
-  const identicalTarget = currentSnapshot.occurrences.find(
-    (occurrence) =>
-      occurrence.source.effective &&
-      occurrence.agentId === plan.targetAgentId &&
-      occurrence.identityFingerprint === plan.sourceIdentityFingerprint,
-  );
-  if (identicalTarget) {
-    throw new Error('The target effective configuration gained this MCP identity after the preview. Refresh before applying.');
-  }
-  const conflictingTarget = currentSnapshot.occurrences.find(
-    (occurrence) =>
-      occurrence.source.effective &&
-      occurrence.agentId === plan.targetAgentId &&
-      occurrence.name === plan.targetName,
-  );
-  if (conflictingTarget) {
-    throw new Error(`The target effective configuration gained "${plan.targetName}" after the preview. Refresh before applying.`);
+  if (plan.operation === 'add') {
+    const identicalTarget = currentSnapshot.occurrences.find(
+      (occurrence) =>
+        occurrence.source.effective &&
+        occurrence.agentId === plan.targetAgentId &&
+        occurrence.identityFingerprint === plan.sourceIdentityFingerprint,
+    );
+    if (identicalTarget) {
+      throw new Error('The target effective configuration gained this MCP identity after the preview. Refresh before applying.');
+    }
+    const conflictingTarget = currentSnapshot.occurrences.find(
+      (occurrence) =>
+        occurrence.source.effective &&
+        occurrence.agentId === plan.targetAgentId &&
+        occurrence.name === plan.targetName,
+    );
+    if (conflictingTarget) {
+      throw new Error(`The target effective configuration gained "${plan.targetName}" after the preview. Refresh before applying.`);
+    }
   }
   const currentSource = currentSnapshot.occurrences.find(
     (occurrence) =>

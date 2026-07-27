@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildFingerprints, toPublicOccurrence, type RawMcpOccurrence } from './domain';
+import { authFingerprint, buildFingerprints, toPublicOccurrence, type RawAuth, type RawMcpOccurrence } from './domain';
 
 function occurrence(): RawMcpOccurrence {
   const transport = {
@@ -16,6 +16,14 @@ function occurrence(): RawMcpOccurrence {
     agentId: 'claude',
     name: 'example',
     transport,
+    auth: {
+      oauthMode: 'pre-registered',
+      clientId: 'public-oauth-client',
+      clientSecret: 'literal-oauth-client-secret',
+      credentialKind: 'static-headers',
+      credentialHeaderKeys: ['Authorization'],
+      environmentVariables: [],
+    },
     enabled: true,
     ...buildFingerprints(transport, { transport, enabled: true }),
     source: {
@@ -44,6 +52,8 @@ describe('public MCP occurrence redaction', () => {
     expect(value.transport.envKeys).toEqual(['API_TOKEN', 'SAFE_NAME']);
     expect(value.transport.headerKeys).toEqual(['Authorization', 'X-Region']);
     expect(value.hasSecrets).toBe(true);
+    expect(value.auth.hasClientSecret).toBe(true);
+    expect(value.auth.oauthFields).toContain('client secret');
     for (const secret of [
       'password',
       'path-secret',
@@ -55,6 +65,7 @@ describe('public MCP occurrence redaction', () => {
       'still-private',
       'env-secret',
       'header-secret',
+      'literal-oauth-client-secret',
       'us-east-1',
     ]) {
       expect(serialized).not.toContain(secret);
@@ -66,6 +77,33 @@ describe('public MCP occurrence redaction', () => {
     const openCode = { kind: 'stdio' as const, command: 'node', args: ['{env:SCRIPT_PATH}'] };
 
     expect(buildFingerprints(dollar, dollar)).toEqual(buildFingerprints(openCode, openCode));
+  });
+
+  it('treats oauth:false as the same effective strategy when credential headers are configured', () => {
+    const automatic: RawAuth = {
+      oauthMode: 'automatic',
+      credentialKind: 'bearer-environment',
+      credentialHeaderKeys: ['Authorization'],
+      environmentVariables: ['TOKEN'],
+    };
+    const disabled: RawAuth = { ...automatic, oauthMode: 'disabled' };
+
+    expect(authFingerprint(automatic)).toEqual(authFingerprint(disabled));
+  });
+
+  it('does not put a literal OAuth client secret into fingerprint input', () => {
+    const auth: RawAuth = {
+      oauthMode: 'pre-registered',
+      clientId: 'public-client',
+      clientSecret: 'literal-client-secret-value',
+      credentialKind: 'none',
+      credentialHeaderKeys: [],
+      environmentVariables: [],
+    };
+
+    const serialized = JSON.stringify(authFingerprint(auth));
+    expect(serialized).not.toContain('literal-client-secret-value');
+    expect(serialized).toContain('configured');
   });
 
   it('groups exact stdio and remote variants into stable MCP families', () => {

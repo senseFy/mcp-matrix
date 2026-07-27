@@ -3,6 +3,51 @@ export const AGENT_IDS = ['claude', 'codex', 'droid', 'amp', 'opencode'] as cons
 export type AgentId = (typeof AGENT_IDS)[number];
 export type TransportKind = 'stdio' | 'http' | 'sse' | 'websocket' | 'unknown';
 export type ConfigScope = 'user' | 'local' | 'project' | 'folder' | 'workspace';
+export type AuthKind =
+  | 'not-applicable'
+  | 'automatic-oauth'
+  | 'oauth-disabled'
+  | 'oauth-client'
+  | 'bearer-environment'
+  | 'header-environment'
+  | 'static-headers'
+  | 'client-managed';
+
+export interface PublicAuth {
+  kind: AuthKind;
+  oauthMode: 'not-applicable' | 'automatic' | 'disabled' | 'pre-registered' | 'client-managed';
+  oauthFields: string[];
+  environmentVariables: string[];
+  requiresTargetLogin: boolean;
+  hasClientSecret: boolean;
+}
+
+export interface AgentAuthCapabilities {
+  automaticOAuth: boolean;
+  oauthDisabled: boolean;
+  preRegisteredOAuth: 'native-config' | 'external-cli' | 'unsupported';
+  bearerEnvironment: boolean;
+  customHeaderEnvironment: boolean;
+}
+
+export type AuthUpdate =
+  | { kind: 'automatic-oauth'; scopes?: string[]; resource?: string }
+  | { kind: 'oauth-disabled' }
+  | { kind: 'bearer-environment'; environmentVariable: string }
+  | {
+      kind: 'header-environment';
+      headerName: string;
+      environmentVariable: string;
+      prefix?: string;
+    }
+  | {
+      kind: 'oauth-client';
+      authorizationServerIssuer?: string;
+      clientId: string;
+      clientSecretEnvironmentVariable?: string;
+      scopes?: string[];
+      callbackPort?: number;
+    };
 
 export interface PublicTransport {
   kind: TransportKind;
@@ -28,6 +73,7 @@ export interface PublicMcpOccurrence {
   agentId: AgentId;
   name: string;
   transport: PublicTransport;
+  auth: PublicAuth;
   enabled: boolean;
   timeoutMs?: number;
   includeTools?: string[];
@@ -46,6 +92,7 @@ export interface AgentDefinition {
   shortName: string;
   configKey: string;
   transports: TransportKind[];
+  authCapabilities: AgentAuthCapabilities;
 }
 
 export interface AgentSnapshot extends AgentDefinition {
@@ -74,6 +121,7 @@ export interface SnapshotResponse {
 
 export interface ChangePlan {
   planId: string;
+  operation: 'add' | 'configure-auth';
   occurrenceId: string;
   targetAgentId: AgentId;
   targetName: string;

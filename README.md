@@ -2,7 +2,7 @@
 
 A local-first MCP configuration manager for coding agents.
 
-MCP Matrix reads each supported agent's native configuration, normalizes only the portable MCP fields, and lets you preview a native diff before copying a server to another agent.
+MCP Matrix reads each supported agent's native configuration, normalizes portable MCP and authentication fields, and lets you preview a native diff before copying a server or changing its authentication policy.
 
 > Configuration, not connection. MCP Matrix does not proxy or run MCP traffic.
 
@@ -62,9 +62,23 @@ MCP Matrix keeps three deliberately separate fingerprints:
 
 - **Family** groups related definitions for navigation, such as GitKraken client-specific launch arguments or Supabase project endpoints.
 - **Exact identity** represents the complete command plus arguments, or the complete remote URL. Copy, duplicate, and name-conflict checks always use this level.
-- **Config** also includes portable options such as environment keys, headers, enabled state, timeouts, and tool filters.
+- **Config** also includes portable options such as authentication policy, environment keys, headers, enabled state, timeouts, and tool filters.
 
 A family can therefore contain multiple exact variants. MCP Matrix shows them together so the relationship is visible, but never assumes that variants are interchangeable and never overwrites one with another. Remote query values remain hidden; only parameter names and a process-local equality fingerprint are shown.
+
+## Authentication management
+
+For remote servers, the inspector shows the authentication policy represented by the native config. It does **not** claim that the agent is currently authenticated: login sessions, access tokens, refresh tokens, keychains, and agent credential stores remain private to each agent.
+
+Depending on the target agent's native schema, MCP Matrix can preview and apply:
+
+- automatic OAuth, which still requires a separate login in each agent;
+- a Bearer token sourced from a named environment variable;
+- a custom credential header sourced from a named environment variable;
+- explicit `oauth: false` where the agent supports it; and
+- safe pre-registered OAuth client metadata where it is natively configurable.
+
+There are no token or client-secret value inputs. MCP Matrix writes environment-variable references only where the agent documents a native representation. The variable itself must be available in the environment that launches the coding agent.
 
 ## Checks
 
@@ -77,7 +91,7 @@ npm run build
 ## Current safety constraints
 
 - Distribution currently targets **user scope** only. Project, folder, and workspace layers are read and explained, but are not write targets yet.
-- Existing target entries are never overwritten. Remove or reconcile them explicitly before distributing another definition.
+- Existing target entries are never overwritten by distribution. Authentication reconciliation changes only the selected entry's native authentication fields after a separate diff preview.
 - Literal token-like environment values, authorization headers, credential-bearing URLs, and token arguments are read-only: copy plans require a portable environment/file reference instead of duplicating the credential.
 - Legacy SSE cannot be copied to Codex or OpenCode because neither current native schema exposes an explicit legacy SSE transport.
 - An environment reference is copied to Codex only when its native `env_vars`, `env_http_headers`, or `bearer_token_env_var` representation preserves the same meaning.

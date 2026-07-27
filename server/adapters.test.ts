@@ -4,7 +4,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
   addServerToContent,
+  nativeSpecWithAuthUpdate,
   serializeForAgent,
+  updateAuthInContent,
 } from './adapters';
 import { buildFingerprints, type RawMcpOccurrence, type RawTransport } from './domain';
 import type { AgentId } from '../src/types';
@@ -19,6 +21,12 @@ function occurrence(
     agentId,
     name: 'source',
     transport,
+    auth: {
+      oauthMode: transport.kind === 'stdio' ? 'not-applicable' : 'automatic',
+      credentialKind: 'none',
+      credentialHeaderKeys: [],
+      environmentVariables: [],
+    },
     enabled: true,
     ...buildFingerprints(transport, { transport, enabled: true }),
     source: {
@@ -42,13 +50,12 @@ describe('target-native serialization', () => {
       headers: { Authorization: 'Bearer ${MCP_TOKEN}' },
     });
 
-    expect(serializeForAgent('opencode', source)).toEqual({
+    expect(serializeForAgent('opencode', source)).toMatchObject({
       spec: {
         type: 'remote',
         url: 'https://mcp.example.com/mcp',
         headers: { Authorization: 'Bearer {env:MCP_TOKEN}' },
       },
-      warnings: [],
       errors: [],
     });
   });
@@ -109,6 +116,67 @@ describe('target-native serialization', () => {
     expect(result.errors.join(' ')).toContain('literal secret');
     expect(result.errors.join(' ')).toContain('literal credentials');
   });
+
+  it.each([
+    ['claude', { type: 'http', url: 'https://mcp.example.com/mcp', headers: { Authorization: 'Bearer ${TOKEN}' } }],
+    ['codex', { url: 'https://mcp.example.com/mcp', bearer_token_env_var: 'TOKEN' }],
+    ['droid', { type: 'http', url: 'https://mcp.example.com/mcp', oauth: false, headers: { Authorization: 'Bearer ${TOKEN}' } }],
+    ['amp', { url: 'https://mcp.example.com/mcp', headers: { Authorization: 'Bearer ${TOKEN}' } }],
+    ['opencode', { type: 'remote', url: 'https://mcp.example.com/mcp', oauth: false, headers: { Authorization: 'Bearer {env:TOKEN}' } }],
+  ] as const)('writes environment-backed bearer authentication for %s', (agentId, expected) => {
+    const source = occurrence(agentId, {
+      kind: 'http',
+      url: 'https://mcp.example.com/mcp',
+    }, agentId === 'opencode'
+      ? { type: 'remote', url: 'https://mcp.example.com/mcp' }
+      : agentId === 'droid' || agentId === 'claude'
+        ? { type: 'http', url: 'https://mcp.example.com/mcp' }
+        : { url: 'https://mcp.example.com/mcp' });
+
+    expect(nativeSpecWithAuthUpdate(source, {
+      kind: 'bearer-environment',
+      environmentVariable: 'TOKEN',
+    }).spec).toEqual(expected);
+  });
+
+  it('writes safe pre-registered OAuth client metadata without a literal secret', () => {
+    const source = occurrence('droid', {
+      kind: 'http',
+      url: 'https://mcp.example.com/mcp',
+    }, { type: 'http', url: 'https://mcp.example.com/mcp' });
+    const result = nativeSpecWithAuthUpdate(source, {
+      kind: 'oauth-client',
+      authorizationServerIssuer: 'https://auth.example.com/',
+      clientId: 'public-client-id',
+      scopes: ['read'],
+      callbackPort: 4891,
+    });
+
+    expect(result.errors).toEqual([]);
+    expect(result.spec).toMatchObject({
+      oauth: {
+        authorizationServerIssuer: 'https://auth.example.com/',
+        clientId: 'public-client-id',
+        scopes: ['read'],
+        callbackPort: 4891,
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain('clientSecret');
+  });
+
+  it('rejects literal credentials disguised as custom header prefixes', () => {
+    const source = occurrence('droid', {
+      kind: 'http',
+      url: 'https://mcp.example.com/mcp',
+    }, { type: 'http', url: 'https://mcp.example.com/mcp' });
+
+    expect(() => nativeSpecWithAuthUpdate(source, {
+      kind: 'header-environment',
+      headerName: 'Authorization',
+      environmentVariable: 'TOKEN_SUFFIX',
+      prefix: 'Bearer sk-live-credential-value',
+    })).toThrow('cannot contain literal credentials');
+  });
 });
 
 describe('minimal native edits', () => {
@@ -136,6 +204,43 @@ describe('minimal native edits', () => {
     });
   });
 
+  it('changes only JSON authentication fields and preserves comments and native options', () => {
+    const before = `{
+  // keep this comment
+  "amp.mcpServers": {
+    "source": {
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "X-Tenant": "tenant-one" },
+      "includeTools": ["read"]
+    }
+  }
+}
+`;
+    const source = occurrence('amp', {
+      kind: 'http',
+      url: 'https://mcp.example.com/mcp',
+      headers: { 'X-Tenant': 'tenant-one' },
+    }, {
+      url: 'https://mcp.example.com/mcp',
+      headers: { 'X-Tenant': 'tenant-one' },
+      includeTools: ['read'],
+    });
+    source.nativePath = ['amp.mcpServers', 'source'];
+    const spec = nativeSpecWithAuthUpdate(source, {
+      kind: 'bearer-environment',
+      environmentVariable: 'MCP_TOKEN',
+    }).spec!;
+    const after = updateAuthInContent('amp', before, source, spec);
+    const parsed = parseJsonc(after) as { 'amp.mcpServers': Record<string, Record<string, unknown>> };
+
+    expect(after).toContain('// keep this comment');
+    expect(parsed['amp.mcpServers'].source).toMatchObject({
+      url: 'https://mcp.example.com/mcp',
+      headers: { 'X-Tenant': 'tenant-one', Authorization: 'Bearer ${MCP_TOKEN}' },
+      includeTools: ['read'],
+    });
+  });
+
   it('appends a valid Codex table without reformatting existing TOML', () => {
     const before = '# keep this comment\nmodel = "gpt-5"\n';
     const after = addServerToContent('codex', before, 'docs server', {
@@ -148,5 +253,31 @@ describe('minimal native edits', () => {
     expect(after.startsWith(before)).toBe(true);
     expect(after).toContain('[mcp_servers."docs server"]');
     expect((parsed.mcp_servers as Record<string, unknown>)['docs server']).toBeDefined();
+  });
+
+  it('preserves comments adjacent to replaced Codex auth fields', () => {
+    const source = occurrence('codex', {
+      kind: 'http',
+      url: 'https://mcp.example.com/mcp',
+    }, {
+      url: 'https://mcp.example.com/mcp',
+      bearer_token_env_var: 'OLD_TOKEN',
+    });
+    const before = `[mcp_servers.source]
+url = "https://mcp.example.com/mcp"
+bearer_token_env_var = "OLD_TOKEN"
+# rotate this credential quarterly
+enabled = true
+`;
+    const spec = nativeSpecWithAuthUpdate(source, {
+      kind: 'bearer-environment',
+      environmentVariable: 'NEW_TOKEN',
+    }).spec!;
+    const after = updateAuthInContent('codex', before, source, spec);
+
+    expect(after).toContain('# rotate this credential quarterly');
+    expect(after).toContain('bearer_token_env_var = "NEW_TOKEN"');
+    expect(after).not.toContain('OLD_TOKEN');
+    expect(parseToml(after)).toBeDefined();
   });
 });

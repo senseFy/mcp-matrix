@@ -3,14 +3,16 @@ import { readFile } from 'node:fs/promises';
 import { applyEdits, modify, parse as parseJsonc, type ParseError } from 'jsonc-parser';
 import { parse as parseToml } from 'smol-toml';
 
-import type { AgentId, SnapshotIssue, TransportKind } from '../src/types';
+import type { AgentId, AuthUpdate, SnapshotIssue, TransportKind } from '../src/types';
 import {
+  authFingerprint,
   buildFingerprints,
   buildOccurrenceId,
   looksLikeLiteralSecret,
   parsePureEnvironmentReference,
   redactConfigContent,
   sha256,
+  type RawAuth,
   type RawMcpOccurrence,
   type RawTransport,
 } from './domain';
@@ -62,6 +64,116 @@ function asStringRecord(value: unknown): Record<string, string> | undefined {
   return entries.length ? Object.fromEntries(entries) : undefined;
 }
 
+function environmentReferences(value: string): string[] {
+  return [...value.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}|\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g)]
+    .map((match) => match[1] ?? match[2]);
+}
+
+function isCredentialHeader(key: string): boolean {
+  return /authorization|(?:^|[-_])auth(?:entication)?(?:$|[-_])|api.?key|token|secret|cookie/i.test(key);
+}
+
+function credentialAuth(headers: Record<string, string> | undefined): Pick<
+  RawAuth,
+  'credentialKind' | 'credentialHeaderKeys' | 'environmentVariables'
+> {
+  const credentialEntries = Object.entries(headers ?? {}).filter(([key]) => isCredentialHeader(key));
+  if (!credentialEntries.length) {
+    return { credentialKind: 'none', credentialHeaderKeys: [], environmentVariables: [] };
+  }
+  const environmentVariables = [...new Set(
+    credentialEntries.flatMap(([, value]) => environmentReferences(value)),
+  )].sort();
+  const bearerEnvironment = credentialEntries.length === 1 &&
+    credentialEntries[0][0].toLocaleLowerCase() === 'authorization' &&
+    /^Bearer\s+(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\{env:[A-Za-z_][A-Za-z0-9_]*\})$/.test(
+      credentialEntries[0][1],
+    );
+  return {
+    credentialKind: bearerEnvironment
+      ? 'bearer-environment'
+      : environmentVariables.length === credentialEntries.length
+        ? 'header-environment'
+        : 'static-headers',
+    credentialHeaderKeys: credentialEntries.map(([key]) => key).sort(),
+    environmentVariables,
+  };
+}
+
+function baseAuth(transport: RawTransport): RawAuth {
+  return {
+    oauthMode: transport.kind === 'stdio' || transport.kind === 'unknown' ? 'not-applicable' : 'automatic',
+    ...credentialAuth(transport.headers),
+  };
+}
+
+function normalizeJsonAuth(
+  agentId: Exclude<AgentId, 'codex' | 'opencode'>,
+  spec: UnknownRecord,
+  transport: RawTransport,
+): RawAuth {
+  const auth = baseAuth(transport);
+  if (auth.oauthMode === 'not-applicable' || agentId === 'amp') return auth;
+  const oauthValue = spec.oauth;
+  if (oauthValue === false) {
+    auth.oauthMode = 'disabled';
+    return auth;
+  }
+  const oauth = asRecord(oauthValue);
+  if (!oauth) return auth;
+  auth.clientId = asString(oauth.clientId);
+  auth.clientSecret = asString(oauth.clientSecret);
+  auth.oauthMode = auth.clientId ? 'pre-registered' : 'automatic';
+  auth.callbackPort = asNumber(oauth.callbackPort);
+  if (agentId === 'claude') {
+    auth.authServerMetadataUrl = asString(oauth.authServerMetadataUrl);
+    const scopes = asString(oauth.scopes);
+    if (scopes) auth.scopes = scopes.split(/\s+/).filter(Boolean);
+  } else {
+    auth.authorizationServerIssuer = asString(oauth.authorizationServerIssuer);
+    auth.clientMetadataUrl = asString(oauth.clientMetadataUrl);
+    auth.scopes = asStringArray(oauth.scopes);
+    const resource = oauth.resource;
+    if (typeof resource === 'string' || resource === false) auth.resource = resource;
+    auth.tokenEndpointAuthMethod = asString(oauth.tokenEndpointAuthMethod);
+  }
+  auth.environmentVariables = [...new Set([
+    ...auth.environmentVariables,
+    ...(auth.clientSecret ? environmentReferences(auth.clientSecret) : []),
+  ])].sort();
+  return auth;
+}
+
+function normalizeOpenCodeAuth(spec: UnknownRecord, transport: RawTransport): RawAuth {
+  const auth = baseAuth(transport);
+  if (auth.oauthMode === 'not-applicable') return auth;
+  if (spec.oauth === false) {
+    auth.oauthMode = 'disabled';
+    return auth;
+  }
+  const oauth = asRecord(spec.oauth);
+  if (!oauth) return auth;
+  auth.clientId = asString(oauth.clientId);
+  auth.clientSecret = asString(oauth.clientSecret);
+  auth.oauthMode = auth.clientId ? 'pre-registered' : 'automatic';
+  const scope = asString(oauth.scope);
+  if (scope) auth.scopes = scope.split(/\s+/).filter(Boolean);
+  auth.environmentVariables = [...new Set([
+    ...auth.environmentVariables,
+    ...(auth.clientSecret ? environmentReferences(auth.clientSecret) : []),
+  ])].sort();
+  return auth;
+}
+
+function normalizeCodexAuth(spec: UnknownRecord, transport: RawTransport): RawAuth {
+  const auth = baseAuth(transport);
+  if (auth.oauthMode === 'not-applicable') return auth;
+  if (asString(spec.auth) === 'chatgpt') auth.oauthMode = 'client-managed';
+  auth.scopes = asStringArray(spec.scopes);
+  auth.resource = asString(spec.oauth_resource);
+  return auth;
+}
+
 function parseJsonDocument(content: string): { data?: UnknownRecord; error?: string } {
   const errors: ParseError[] = [];
   const data = parseJsonc(content, errors, {
@@ -107,6 +219,7 @@ function normalizeJsonSpec(
     env: asStringRecord(spec.env),
     headers: asStringRecord(spec.headers),
   };
+  const auth = normalizeJsonAuth(agentId, spec, transport);
   const warnings: string[] = [];
   if (transport.kind === 'stdio' && !transport.command) {
     transport.kind = 'unknown';
@@ -136,7 +249,7 @@ function normalizeJsonSpec(
         ? asStringArray(spec.includeTools)
         : undefined;
   const excludeTools = agentId === 'droid' ? asStringArray(spec.disabledTools) : undefined;
-  const portable = { transport, enabled, timeoutMs, includeTools, excludeTools };
+  const portable = { transport, auth: authFingerprint(auth), enabled, timeoutMs, includeTools, excludeTools };
   const fingerprints = buildFingerprints(transport, portable, name);
 
   return {
@@ -144,6 +257,7 @@ function normalizeJsonSpec(
     agentId,
     name,
     transport,
+    auth,
     enabled,
     timeoutMs,
     includeTools,
@@ -157,6 +271,12 @@ function normalizeJsonSpec(
       precedence: source.precedence,
     },
     sourceRevisions: [{ path: source.path, hash: fileHash }],
+    nativePath:
+      agentId === 'claude' && source.selector === 'claude-local'
+        ? ['projects', source.projectKey ?? '', 'mcpServers', name]
+        : agentId === 'amp'
+          ? ['amp.mcpServers', name]
+          : ['mcpServers', name],
     warnings,
     native: spec,
   };
@@ -180,6 +300,7 @@ function normalizeOpenCodeSpec(
     env: asStringRecord(spec.environment),
     headers: asStringRecord(spec.headers),
   };
+  const auth = normalizeOpenCodeAuth(spec, transport);
   const warnings: string[] = [];
   if (type === 'local' && !command?.length) warnings.push('Missing command array for a local server.');
   if (type === 'remote' && !url) warnings.push('Missing URL for a remote server.');
@@ -189,7 +310,7 @@ function normalizeOpenCodeSpec(
   if (discoveryTimeout !== undefined) {
     warnings.push('OpenCode timeout controls initial tool discovery and is not a portable tool-call timeout.');
   }
-  const portable = { transport, enabled };
+  const portable = { transport, auth: authFingerprint(auth), enabled };
   const fingerprints = buildFingerprints(transport, portable, name);
 
   return {
@@ -197,6 +318,7 @@ function normalizeOpenCodeSpec(
     agentId: 'opencode',
     name,
     transport,
+    auth,
     enabled,
     timeoutMs: undefined,
     ...fingerprints,
@@ -208,6 +330,7 @@ function normalizeOpenCodeSpec(
       precedence: source.precedence,
     },
     sourceRevisions: [{ path: source.path, hash: fileHash }],
+    nativePath: ['mcp', name],
     warnings,
     native: spec,
   };
@@ -253,6 +376,7 @@ function normalizeCodexSpec(
     env: Object.keys(env).length ? env : undefined,
     headers: Object.keys(headers).length ? headers : undefined,
   };
+  const auth = normalizeCodexAuth(spec, transport);
   if (transport.kind === 'unknown') warnings.push('Codex server needs either command or url.');
   if (source.scope === 'project') {
     warnings.push('Codex loads project-scoped MCP configuration only for trusted projects.');
@@ -262,7 +386,7 @@ function normalizeCodexSpec(
   const includeTools = asStringArray(spec.enabled_tools);
   const excludeTools = asStringArray(spec.disabled_tools);
   const enabled = asBoolean(spec.enabled) !== false;
-  const portable = { transport, enabled, timeoutMs, includeTools, excludeTools };
+  const portable = { transport, auth: authFingerprint(auth), enabled, timeoutMs, includeTools, excludeTools };
   const fingerprints = buildFingerprints(transport, portable, name);
 
   return {
@@ -270,6 +394,7 @@ function normalizeCodexSpec(
     agentId: 'codex',
     name,
     transport,
+    auth,
     enabled,
     timeoutMs,
     includeTools,
@@ -528,7 +653,7 @@ function applyPortableExtras(
 }
 
 const mappedNativeKeys: Record<AgentId, Set<string>> = {
-  claude: new Set(['type', 'command', 'args', 'cwd', 'url', 'env', 'headers', 'timeout']),
+  claude: new Set(['type', 'command', 'args', 'cwd', 'url', 'env', 'headers', 'oauth', 'timeout']),
   codex: new Set([
     'command',
     'args',
@@ -539,6 +664,9 @@ const mappedNativeKeys: Record<AgentId, Set<string>> = {
     'bearer_token_env_var',
     'http_headers',
     'env_http_headers',
+    'auth',
+    'scopes',
+    'oauth_resource',
     'enabled',
     'tool_timeout_sec',
     'enabled_tools',
@@ -551,13 +679,14 @@ const mappedNativeKeys: Record<AgentId, Set<string>> = {
     'url',
     'env',
     'headers',
+    'oauth',
     'disabled',
     'enabledTools',
     'disabledTools',
     'timeoutMs',
   ]),
   amp: new Set(['command', 'args', 'url', 'env', 'headers', 'includeTools']),
-  opencode: new Set(['type', 'command', 'cwd', 'url', 'environment', 'headers', 'enabled']),
+  opencode: new Set(['type', 'command', 'cwd', 'url', 'environment', 'headers', 'oauth', 'enabled']),
 };
 
 function warnAboutClientSpecificFields(source: RawMcpOccurrence, warnings: string[]): void {
@@ -610,6 +739,63 @@ function rejectLiteralSecrets(source: RawMcpOccurrence, errors: string[]): void 
       // Templated URLs are validated by the target reference converter.
     }
   }
+}
+
+function applyOAuthOverrides(
+  target: AgentId,
+  source: RawMcpOccurrence,
+  spec: UnknownRecord,
+  warnings: string[],
+): void {
+  if (source.transport.kind === 'stdio' || source.transport.kind === 'unknown') return;
+  const hasCredentialHeaders = source.auth.credentialKind !== 'none';
+
+  if (hasCredentialHeaders) {
+    if (target === 'droid' || target === 'opencode') spec.oauth = false;
+    else if (target === 'codex') {
+      warnings.push('Codex tries configured bearer/header credentials before its managed OAuth fallback.');
+    }
+    return;
+  }
+
+  if (source.auth.oauthMode === 'disabled') {
+    if (target === 'droid' || target === 'opencode') spec.oauth = false;
+    else warnings.push(`${target} has no native per-server oauth:false field; explicit OAuth disablement was omitted.`);
+    return;
+  }
+
+  if (source.auth.oauthMode === 'client-managed') {
+    warnings.push('The source uses an agent-owned authentication identity that cannot be transferred; authenticate the target agent separately.');
+  } else if (source.auth.oauthMode === 'pre-registered') {
+    warnings.push('Pre-registered OAuth client IDs, callback bindings, and secrets are target-specific and were not copied; register the target agent separately.');
+  } else if (source.auth.oauthMode === 'automatic') {
+    warnings.push('OAuth access and refresh tokens are agent-owned and were not copied; if this server requires OAuth, authenticate the target agent separately.');
+  }
+
+  const scopes = source.auth.scopes;
+  const resource = typeof source.auth.resource === 'string' ? source.auth.resource : undefined;
+  if (target === 'codex') {
+    if (scopes?.length) spec.scopes = scopes;
+    if (resource) spec.oauth_resource = resource;
+    return;
+  }
+  if (target === 'amp') {
+    if (scopes?.length || resource) {
+      warnings.push('Amp stores OAuth scopes and registration outside amp.mcpServers; configure them with amp mcp oauth login.');
+    }
+    return;
+  }
+  const oauth: UnknownRecord = {};
+  if (target === 'claude') {
+    if (scopes?.length) oauth.scopes = scopes.join(' ');
+    if (source.auth.authServerMetadataUrl) oauth.authServerMetadataUrl = source.auth.authServerMetadataUrl;
+  } else if (target === 'droid') {
+    if (scopes?.length) oauth.scopes = scopes;
+    if (source.auth.resource !== undefined) oauth.resource = source.auth.resource;
+  } else if (target === 'opencode' && scopes?.length) {
+    oauth.scope = scopes.join(' ');
+  }
+  if (Object.keys(oauth).length) spec.oauth = oauth;
 }
 
 function serializeCodex(source: RawMcpOccurrence): NativeSerialization {
@@ -669,6 +855,7 @@ function serializeCodex(source: RawMcpOccurrence): NativeSerialization {
   } else {
     errors.push('The source transport is invalid or unknown.');
   }
+  applyOAuthOverrides('codex', source, spec, warnings);
   applyPortableExtras('codex', source, spec, warnings);
   return { spec: errors.length ? undefined : spec, warnings, errors };
 }
@@ -724,6 +911,7 @@ export function serializeForAgent(target: AgentId, source: RawMcpOccurrence): Na
     if (env) spec.env = env;
   }
 
+  applyOAuthOverrides(target, source, spec, warnings);
   applyPortableExtras(target, source, spec, warnings);
   return { spec: errors.length ? undefined : spec, warnings, errors };
 }
@@ -780,6 +968,278 @@ function tomlMap(values: Record<string, string>): string {
     .join(', ')} }`;
 }
 
+const codexAuthKeys = [
+  'bearer_token_env_var',
+  'http_headers',
+  'env_http_headers',
+  'auth',
+  'scopes',
+  'oauth_resource',
+] as const;
+
+function validateEnvironmentVariable(value: string): void {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
+    throw new Error('Environment variable names may contain only letters, numbers, and underscores, and cannot start with a number.');
+  }
+}
+
+function validateHeaderName(value: string): void {
+  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(value)) throw new Error('Invalid HTTP header name.');
+}
+
+function withoutCredentialHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {
+  const entries = Object.entries(headers ?? {}).filter(([key]) => !isCredentialHeader(key));
+  return entries.length ? Object.fromEntries(entries) : undefined;
+}
+
+function applyJsonAuthUpdate(
+  agentId: Exclude<AgentId, 'codex'>,
+  occurrence: RawMcpOccurrence,
+  update: AuthUpdate,
+  warnings: string[],
+  errors: string[],
+): UnknownRecord {
+  const spec = structuredClone(occurrence.native);
+  const headers = withoutCredentialHeaders(asStringRecord(spec.headers));
+  if (headers) spec.headers = headers;
+  else delete spec.headers;
+  delete spec.oauth;
+
+  const environmentReference = (name: string) => agentId === 'opencode' ? `{env:${name}}` : `\${${name}}`;
+  if (update.kind === 'bearer-environment') {
+    validateEnvironmentVariable(update.environmentVariable);
+    spec.headers = { ...(headers ?? {}), Authorization: `Bearer ${environmentReference(update.environmentVariable)}` };
+    if (agentId === 'droid' || agentId === 'opencode') spec.oauth = false;
+    return spec;
+  }
+  if (update.kind === 'header-environment') {
+    validateHeaderName(update.headerName);
+    validateEnvironmentVariable(update.environmentVariable);
+    const prefix = update.prefix ?? '';
+    if (prefix.length > 64) throw new Error('Header prefixes cannot exceed 64 characters.');
+    if (/[\r\n${}]/.test(prefix)) throw new Error('Header prefixes cannot contain newlines or environment templates.');
+    if (looksLikeLiteralSecret('', prefix)) throw new Error('Header prefixes cannot contain literal credentials.');
+    spec.headers = {
+      ...(headers ?? {}),
+      [update.headerName]: `${prefix}${environmentReference(update.environmentVariable)}`,
+    };
+    if (agentId === 'droid' || agentId === 'opencode') spec.oauth = false;
+    return spec;
+  }
+  if (update.kind === 'oauth-disabled') {
+    if (agentId !== 'droid' && agentId !== 'opencode') {
+      errors.push(`${agentId} has no native per-server oauth:false field.`);
+    } else spec.oauth = false;
+    return spec;
+  }
+  if (update.kind === 'automatic-oauth') {
+    const oauth: UnknownRecord = {};
+    if (agentId === 'claude') {
+      if (update.scopes?.length) oauth.scopes = update.scopes.join(' ');
+      if (update.resource) warnings.push('Claude Code has no documented per-server OAuth resource override; it was omitted.');
+    } else if (agentId === 'droid') {
+      if (update.scopes?.length) oauth.scopes = update.scopes;
+      if (update.resource) oauth.resource = update.resource;
+    } else if (agentId === 'opencode') {
+      if (update.scopes?.length) oauth.scope = update.scopes.join(' ');
+      if (update.resource) warnings.push('OpenCode has no documented OAuth resource override; it was omitted.');
+    } else if (agentId === 'amp' && (update.scopes?.length || update.resource)) {
+      errors.push('Amp stores OAuth registration outside amp.mcpServers; use amp mcp oauth login for scopes or resource-specific registration.');
+    }
+    if (Object.keys(oauth).length) spec.oauth = oauth;
+    return spec;
+  }
+
+  if (agentId === 'amp') {
+    errors.push('Amp stores pre-registered OAuth clients outside amp.mcpServers; use amp mcp oauth login.');
+    return spec;
+  }
+  if (agentId === 'opencode') {
+    const oauth: UnknownRecord = { clientId: update.clientId };
+    if (update.clientSecretEnvironmentVariable) {
+      validateEnvironmentVariable(update.clientSecretEnvironmentVariable);
+      oauth.clientSecret = `{env:${update.clientSecretEnvironmentVariable}}`;
+    }
+    if (update.scopes?.length) oauth.scope = update.scopes.join(' ');
+    if (update.authorizationServerIssuer) {
+      warnings.push('OpenCode discovers the authorization server and has no issuer override; the supplied issuer was omitted.');
+    }
+    if (update.callbackPort !== undefined) {
+      warnings.push('OpenCode has no documented per-server callback port field; it was omitted.');
+    }
+    spec.oauth = oauth;
+    return spec;
+  }
+  if (agentId === 'claude') {
+    if (update.clientSecretEnvironmentVariable) {
+      errors.push('Claude Code stores OAuth client secrets in its credential store; add this client with claude mcp add --client-secret instead.');
+      return spec;
+    }
+    const oauth: UnknownRecord = { clientId: update.clientId };
+    if (update.scopes?.length) oauth.scopes = update.scopes.join(' ');
+    if (update.callbackPort !== undefined) oauth.callbackPort = update.callbackPort;
+    if (update.authorizationServerIssuer) {
+      warnings.push('Claude Code discovers the authorization server and has no issuer field; the supplied issuer was omitted.');
+    }
+    spec.oauth = oauth;
+    return spec;
+  }
+
+  if (!update.authorizationServerIssuer) {
+    errors.push('Droid requires authorizationServerIssuer with a pre-registered OAuth client.');
+    return spec;
+  }
+  if (update.clientSecretEnvironmentVariable) {
+    errors.push('Droid does not document environment expansion in oauth.clientSecret; Matrix will not write a literal client secret.');
+    return spec;
+  }
+  const oauth: UnknownRecord = {
+    authorizationServerIssuer: update.authorizationServerIssuer,
+    clientId: update.clientId,
+  };
+  if (update.scopes?.length) oauth.scopes = update.scopes;
+  if (update.callbackPort !== undefined) oauth.callbackPort = update.callbackPort;
+  spec.oauth = oauth;
+  return spec;
+}
+
+function applyCodexAuthUpdate(
+  occurrence: RawMcpOccurrence,
+  update: AuthUpdate,
+  warnings: string[],
+  errors: string[],
+): UnknownRecord {
+  const spec = structuredClone(occurrence.native);
+  const staticHeaders = withoutCredentialHeaders(asStringRecord(spec.http_headers));
+  const environmentHeaders = withoutCredentialHeaders(asStringRecord(spec.env_http_headers));
+  for (const key of codexAuthKeys) delete spec[key];
+  if (staticHeaders) spec.http_headers = staticHeaders;
+  if (environmentHeaders) spec.env_http_headers = environmentHeaders;
+
+  if (update.kind === 'bearer-environment') {
+    validateEnvironmentVariable(update.environmentVariable);
+    spec.bearer_token_env_var = update.environmentVariable;
+  } else if (update.kind === 'header-environment') {
+    validateHeaderName(update.headerName);
+    validateEnvironmentVariable(update.environmentVariable);
+    if (update.prefix) errors.push('Codex env_http_headers cannot prepend a value; use Bearer token mode or an environment variable containing the complete header value.');
+    else spec.env_http_headers = { ...(environmentHeaders ?? {}), [update.headerName]: update.environmentVariable };
+  } else if (update.kind === 'automatic-oauth') {
+    spec.auth = 'oauth';
+    if (update.scopes?.length) spec.scopes = update.scopes;
+    if (update.resource) spec.oauth_resource = update.resource;
+  } else if (update.kind === 'oauth-disabled') {
+    errors.push('Codex has no native per-server oauth:false field.');
+  } else {
+    errors.push('Codex does not expose pre-registered MCP OAuth client credentials in config.toml.');
+  }
+  if (occurrence.auth.oauthMode === 'client-managed' && update.kind !== 'automatic-oauth') {
+    warnings.push('This replaces the Codex ChatGPT authentication fallback for this MCP server.');
+  }
+  return spec;
+}
+
+export function nativeSpecWithAuthUpdate(
+  occurrence: RawMcpOccurrence,
+  update: AuthUpdate,
+): NativeSerialization {
+  const warnings: string[] = [];
+  const errors: string[] = [];
+  if (occurrence.transport.kind === 'stdio' || occurrence.transport.kind === 'unknown') {
+    return { warnings, errors: ['Authentication can be configured only for a valid remote MCP server.'] };
+  }
+  if (occurrence.source.scope !== 'user' && occurrence.source.scope !== 'local') {
+    return { warnings, errors: ['Authentication can be changed only in a private user or local configuration layer.'] };
+  }
+  if (update.kind === 'oauth-client') {
+    if (!update.clientId.trim()) errors.push('OAuth client ID is required.');
+    if (update.callbackPort !== undefined && (!Number.isInteger(update.callbackPort) || update.callbackPort < 1 || update.callbackPort > 65_535)) {
+      errors.push('OAuth callback port must be an integer from 1 to 65535.');
+    }
+  }
+  if (errors.length) return { warnings, errors };
+  const spec = occurrence.agentId === 'codex'
+    ? applyCodexAuthUpdate(occurrence, update, warnings, errors)
+    : applyJsonAuthUpdate(occurrence.agentId, occurrence, update, warnings, errors);
+  return { spec: errors.length ? undefined : spec, warnings, errors };
+}
+
+function updateJsonAuthInContent(
+  agentId: Exclude<AgentId, 'codex'>,
+  content: string,
+  occurrence: RawMcpOccurrence,
+  spec: UnknownRecord,
+): string {
+  let output = content;
+  const basePath = occurrence.nativePath ?? jsonPathForAgent(agentId, occurrence.name);
+  for (const key of ['headers', 'oauth']) {
+    output = applyEdits(
+      output,
+      modify(output, [...basePath, key], spec[key], { formattingOptions: formattingOptions(output) }),
+    );
+  }
+  return output;
+}
+
+function updateCodexAuthInContent(content: string, name: string, spec: UnknownRecord): string {
+  const candidates = [`[mcp_servers.${tomlString(name)}]`];
+  if (/^[A-Za-z0-9_-]+$/.test(name)) candidates.push(`[mcp_servers.${name}]`);
+  const lines = content.match(/.*(?:\n|$)/g)?.filter(Boolean) ?? [];
+  let start = -1;
+  let end = content.length;
+  let offset = 0;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (start < 0 && candidates.some((candidate) => trimmed === candidate || trimmed.startsWith(`${candidate} #`))) {
+      start = offset + line.length;
+    } else if (start >= 0 && /^\s*\[/.test(line)) {
+      end = offset;
+      break;
+    }
+    offset += line.length;
+  }
+  if (start < 0) throw new Error(`Unable to locate Codex MCP table for "${name}".`);
+  const nestedPrefixes = candidates.map((candidate) => candidate.slice(0, -1));
+  if (nestedPrefixes.some((prefix) => content.includes(`${prefix}.http_headers]`) || content.includes(`${prefix}.env_http_headers]`))) {
+    throw new Error('Codex auth reconciliation does not rewrite nested header tables; convert them to inline maps first.');
+  }
+  const body = content.slice(start, end);
+  const bodyLines = body.match(/.*(?:\n|$)/g)?.filter(Boolean) ?? [];
+  const kept: string[] = [];
+  for (let index = 0; index < bodyLines.length;) {
+    const assignment = bodyLines[index].match(/^\s*([A-Za-z_][A-Za-z0-9_-]*)\s*=/)?.[1];
+    if (!assignment || !codexAuthKeys.includes(assignment as (typeof codexAuthKeys)[number])) {
+      kept.push(bodyLines[index]);
+      index += 1;
+      continue;
+    }
+    index += 1;
+    while (index < bodyLines.length && !/^\s*[A-Za-z_][A-Za-z0-9_-]*\s*=/.test(bodyLines[index])) {
+      const trimmed = bodyLines[index].trim();
+      if (!trimmed || trimmed.startsWith('#')) kept.push(bodyLines[index]);
+      index += 1;
+    }
+  }
+  const authSpec = Object.fromEntries(codexAuthKeys.flatMap((key) => spec[key] === undefined ? [] : [[key, spec[key]]]));
+  const authLines = codexTable('__auth__', authSpec).split('\n').slice(1, -1);
+  const separator = kept.length && !kept.at(-1)?.endsWith('\n') ? '\n' : '';
+  const nextBody = `${kept.join('')}${separator}${authLines.length ? `${authLines.join('\n')}\n` : ''}`;
+  const output = `${content.slice(0, start)}${nextBody}${content.slice(end)}`;
+  parseToml(output);
+  return output;
+}
+
+export function updateAuthInContent(
+  agentId: AgentId,
+  content: string,
+  occurrence: RawMcpOccurrence,
+  spec: UnknownRecord,
+): string {
+  return agentId === 'codex'
+    ? updateCodexAuthInContent(content, occurrence.name, spec)
+    : updateJsonAuthInContent(agentId, content, occurrence, spec);
+}
+
 function codexTable(name: string, spec: UnknownRecord): string {
   const lines = [`[mcp_servers.${tomlString(name)}]`];
   const orderedKeys = [
@@ -792,6 +1252,9 @@ function codexTable(name: string, spec: UnknownRecord): string {
     'bearer_token_env_var',
     'http_headers',
     'env_http_headers',
+    'auth',
+    'scopes',
+    'oauth_resource',
     'enabled',
     'tool_timeout_sec',
     'enabled_tools',

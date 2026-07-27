@@ -157,4 +157,58 @@ describe('native discovery and normalization', () => {
     expect(broken?.transport.kind).toBe('unknown');
     expect(broken?.warnings.join(' ')).toContain('require type');
   });
+
+  it('normalizes native authentication strategies without reading runtime sessions', async () => {
+    await json(join(home, '.claude.json'), {
+      mcpServers: {
+        claude: {
+          type: 'http',
+          url: 'https://claude.example/mcp',
+          headers: { Authorization: 'Bearer ${CLAUDE_TOKEN}' },
+        },
+      },
+    });
+    await mkdir(join(home, '.codex'), { recursive: true });
+    await writeFile(
+      join(home, '.codex', 'config.toml'),
+      '[mcp_servers.codex]\nurl = "https://codex.example/mcp"\nbearer_token_env_var = "CODEX_TOKEN"\n',
+    );
+    await json(join(home, '.factory', 'mcp.json'), {
+      mcpServers: {
+        droid: {
+          type: 'http',
+          url: 'https://droid.example/mcp',
+          oauth: false,
+          headers: { Authorization: 'Bearer ${DROID_TOKEN}' },
+        },
+      },
+    });
+    await json(join(home, '.config', 'amp', 'settings.json'), {
+      'amp.mcpServers': {
+        amp: { url: 'https://amp.example/mcp', headers: { 'X-Auth': '${AMP_KEY}' } },
+      },
+    });
+    await json(join(home, '.config', 'opencode', 'opencode.json'), {
+      mcp: {
+        opencode: {
+          type: 'remote',
+          url: 'https://opencode.example/mcp',
+          oauth: { clientId: 'public-client', scopes: ['read'] },
+        },
+      },
+    });
+
+    const snapshot = await loadNativeSnapshot(workspace);
+    const auth = Object.fromEntries(
+      snapshot.occurrences
+        .filter((entry) => entry.source.effective)
+        .map((entry) => [entry.agentId, entry.auth]),
+    );
+
+    expect(auth.claude).toMatchObject({ credentialKind: 'bearer-environment', environmentVariables: ['CLAUDE_TOKEN'] });
+    expect(auth.codex).toMatchObject({ credentialKind: 'bearer-environment', environmentVariables: ['CODEX_TOKEN'] });
+    expect(auth.droid).toMatchObject({ oauthMode: 'disabled', credentialKind: 'bearer-environment' });
+    expect(auth.amp).toMatchObject({ credentialKind: 'header-environment', environmentVariables: ['AMP_KEY'] });
+    expect(auth.opencode).toMatchObject({ oauthMode: 'pre-registered', credentialKind: 'none' });
+  });
 });

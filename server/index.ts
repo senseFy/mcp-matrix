@@ -5,11 +5,11 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { AgentId, SnapshotResponse } from '../src/types';
+import type { AgentId, AuthUpdate, SnapshotResponse } from '../src/types';
 import { loadNativeSnapshot } from './adapters';
 import { AGENTS, toPublicOccurrence } from './domain';
 import { detectAgents } from './discovery';
-import { applyPlan, createCopyPlan, undoApply } from './planner';
+import { applyPlan, createAuthPlan, createCopyPlan, undoApply } from './planner';
 
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.PORT ?? 4318);
@@ -75,6 +75,56 @@ function parseAgentId(body: Record<string, unknown>, key: string): AgentId {
   return value;
 }
 
+function optionalStringArray(value: unknown, key: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === 'string')) {
+    throw new Error(`${key} must be an array of strings.`);
+  }
+  return value.map((entry) => entry.trim()).filter(Boolean);
+}
+
+function parseAuthUpdate(value: unknown): AuthUpdate {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('auth must be an object.');
+  const auth = value as Record<string, unknown>;
+  const kind = requiredString(auth, 'kind');
+  if (kind === 'automatic-oauth') {
+    return {
+      kind,
+      scopes: optionalStringArray(auth.scopes, 'auth.scopes'),
+      resource: typeof auth.resource === 'string' && auth.resource.trim() ? auth.resource.trim() : undefined,
+    };
+  }
+  if (kind === 'oauth-disabled') return { kind };
+  if (kind === 'bearer-environment') {
+    return { kind, environmentVariable: requiredString(auth, 'environmentVariable').trim() };
+  }
+  if (kind === 'header-environment') {
+    return {
+      kind,
+      headerName: requiredString(auth, 'headerName').trim(),
+      environmentVariable: requiredString(auth, 'environmentVariable').trim(),
+      prefix: typeof auth.prefix === 'string' ? auth.prefix : undefined,
+    };
+  }
+  if (kind === 'oauth-client') {
+    return {
+      kind,
+      authorizationServerIssuer:
+        typeof auth.authorizationServerIssuer === 'string' && auth.authorizationServerIssuer.trim()
+          ? auth.authorizationServerIssuer.trim()
+          : undefined,
+      clientId: requiredString(auth, 'clientId').trim(),
+      clientSecretEnvironmentVariable:
+        typeof auth.clientSecretEnvironmentVariable === 'string' && auth.clientSecretEnvironmentVariable.trim()
+          ? auth.clientSecretEnvironmentVariable.trim()
+          : undefined,
+      scopes: optionalStringArray(auth.scopes, 'auth.scopes'),
+      callbackPort: typeof auth.callbackPort === 'number' ? auth.callbackPort : undefined,
+    };
+  }
+  throw new Error(`Unsupported authentication strategy: ${kind}`);
+}
+
 async function validateWorkspace(value: string): Promise<string> {
   if (!isAbsolute(value)) throw new Error('Workspace must be an absolute directory path.');
   const workspace = normalize(value);
@@ -133,6 +183,18 @@ async function handleApi(request: IncomingMessage, response: ServerResponse, url
       occurrenceId: requiredString(body, 'occurrenceId'),
       targetAgentId: parseAgentId(body, 'targetAgentId'),
       targetName: typeof body.targetName === 'string' ? body.targetName : undefined,
+    });
+    sendJson(response, 200, plan);
+    return true;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/api/auth-plans') {
+    const body = await readJsonBody(request);
+    const workspace = await validateWorkspace(requiredString(body, 'workspace'));
+    const plan = await createAuthPlan({
+      workspace,
+      occurrenceId: requiredString(body, 'occurrenceId'),
+      auth: parseAuthUpdate(body.auth),
     });
     sendJson(response, 200, plan);
     return true;

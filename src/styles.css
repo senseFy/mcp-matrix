@@ -32,7 +32,7 @@ html, body, #root { width: 100%; height: 100%; margin: 0; }
 
 body { background: var(--bg); color: var(--text); overflow: hidden; font-size: 13px; }
 
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 button { color: inherit; }
 
 .lobe-icon {
@@ -45,7 +45,7 @@ button { color: inherit; }
   -webkit-mask: var(--lobe-icon) center / contain no-repeat;
 }
 
-button:focus-visible, input:focus-visible, a:focus-visible {
+button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible {
   outline: 1px solid var(--blue);
   outline-offset: -1px;
 }
@@ -259,6 +259,12 @@ button:focus-visible, input:focus-visible, a:focus-visible {
 .fingerprint-list span { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .fingerprint-list code { color: #aeb2bb; font: 9px var(--mono); }
 
+.auth-summary { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; }
+.auth-pill { display: inline-flex; align-items: center; gap: 5px; min-height: 21px; padding: 2px 7px; border: 1px solid #34473c; border-radius: 10px; color: #9ecdb0; background: #15221a; font-size: 9px; }
+.auth-summary > small { margin: 0; line-height: 1.45; }
+.auth-configure { height: 25px; display: flex; align-items: center; gap: 5px; padding: 0 7px; border: 1px solid var(--border); border-radius: 3px; background: var(--panel-raised); color: #8bb7f3; cursor: pointer; font-size: 9px; }
+.auth-configure:hover { color: #b7d4fa; border-color: #395274; background: #192333; }
+
 .inspector-warning { margin: 9px 10px; display: flex; align-items: flex-start; gap: 7px; padding: 8px; color: #d9b47b; border: 1px solid #524027; background: var(--amber-bg); border-radius: 4px; font-size: 10px; line-height: 1.45; }
 .inspector-warning svg { flex: 0 0 auto; margin-top: 1px; }
 .inspector-warning p { margin: 0 0 3px; }.inspector-warning p:last-child { margin-bottom: 0; }
@@ -320,6 +326,21 @@ button:focus-visible, input:focus-visible, a:focus-visible {
 .button { height: 29px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 0 11px; border: 1px solid var(--border-strong); border-radius: 4px; cursor: pointer; font-size: 10px; }
 .button.secondary { background: var(--panel-raised); color: var(--text); }.button.secondary:hover { background: var(--panel-hover); }
 .button.primary { color: white; border-color: #3975cf; background: #2d6cc7; }.button.primary:hover { background: #3778d5; }.button:disabled { opacity: .55; cursor: wait; }
+
+.auth-modal { width: min(540px, calc(100vw - 48px)); max-height: calc(100vh - 54px); display: flex; flex-direction: column; border: 1px solid var(--border-strong); border-radius: 6px; background: #141519; box-shadow: 0 22px 70px #000a; overflow: hidden; }
+.auth-modal > header { min-height: 53px; flex: 0 0 53px; display: flex; align-items: center; justify-content: space-between; padding: 0 12px 0 14px; border-bottom: 1px solid var(--border); }
+.auth-modal h2 { margin: 2px 0 0; color: var(--text-strong); font-size: 13px; font-weight: 600; }
+.auth-route { min-height: 39px; display: flex; align-items: center; gap: 9px; padding: 6px 13px; border-bottom: 1px solid var(--border); }
+.auth-route .agent-token { flex: 0 0 auto; }
+.auth-route code { min-width: 0; overflow: hidden; color: #9297a2; font: 9px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+.auth-form { min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 11px; padding: 14px; }
+.auth-form > label { display: flex; flex-direction: column; gap: 6px; }
+.auth-form label > span { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .055em; }
+.auth-form input, .auth-form select { width: 100%; height: 30px; padding: 0 8px; border: 1px solid var(--border); border-radius: 4px; outline: 0; background: #0f1013; color: var(--text); font: 10px var(--mono); }
+.auth-form input:focus, .auth-form select:focus { border-color: #3f6297; }
+.auth-form input::placeholder { color: #50545f; }
+.form-note { margin: 0; padding: 8px 9px; border: 1px solid #2b3038; border-radius: 4px; background: #111317; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.auth-modal > footer { min-height: 50px; display: flex; align-items: center; gap: 7px; padding: 8px 11px; border-top: 1px solid var(--border); }
 
 .toast { position: fixed; z-index: 30; right: 13px; bottom: 13px; min-width: 310px; min-height: 40px; display: flex; align-items: center; gap: 8px; padding: 7px 8px 7px 10px; border: 1px solid #31503e; border-radius: 5px; background: #142019; color: #a9d8bb; box-shadow: 0 12px 34px #0008; font-size: 10px; }
 .toast > span { flex: 1; }.toast > button { height: 24px; display: flex; align-items: center; gap: 4px; border: 1px solid #355743; border-radius: 3px; background: #19291f; color: #a9d8bb; cursor: pointer; font-size: 9px; }

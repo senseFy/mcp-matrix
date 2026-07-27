@@ -4,6 +4,7 @@ import { basename } from 'node:path';
 import type {
   AgentDefinition,
   AgentId,
+  AuthKind,
   ConfigScope,
   PublicMcpOccurrence,
   PublicTransport,
@@ -17,6 +18,13 @@ export const AGENTS: AgentDefinition[] = [
     shortName: 'Claude',
     configKey: 'mcpServers',
     transports: ['stdio', 'http', 'sse', 'websocket'],
+    authCapabilities: {
+      automaticOAuth: true,
+      oauthDisabled: false,
+      preRegisteredOAuth: 'native-config',
+      bearerEnvironment: true,
+      customHeaderEnvironment: true,
+    },
   },
   {
     id: 'codex',
@@ -24,6 +32,13 @@ export const AGENTS: AgentDefinition[] = [
     shortName: 'Codex',
     configKey: 'mcp_servers',
     transports: ['stdio', 'http'],
+    authCapabilities: {
+      automaticOAuth: true,
+      oauthDisabled: false,
+      preRegisteredOAuth: 'unsupported',
+      bearerEnvironment: true,
+      customHeaderEnvironment: true,
+    },
   },
   {
     id: 'droid',
@@ -31,6 +46,13 @@ export const AGENTS: AgentDefinition[] = [
     shortName: 'Droid',
     configKey: 'mcpServers',
     transports: ['stdio', 'http', 'sse'],
+    authCapabilities: {
+      automaticOAuth: true,
+      oauthDisabled: true,
+      preRegisteredOAuth: 'native-config',
+      bearerEnvironment: true,
+      customHeaderEnvironment: true,
+    },
   },
   {
     id: 'amp',
@@ -38,6 +60,13 @@ export const AGENTS: AgentDefinition[] = [
     shortName: 'Amp',
     configKey: 'amp.mcpServers',
     transports: ['stdio', 'http', 'sse'],
+    authCapabilities: {
+      automaticOAuth: true,
+      oauthDisabled: false,
+      preRegisteredOAuth: 'external-cli',
+      bearerEnvironment: true,
+      customHeaderEnvironment: true,
+    },
   },
   {
     id: 'opencode',
@@ -45,6 +74,13 @@ export const AGENTS: AgentDefinition[] = [
     shortName: 'OpenCode',
     configKey: 'mcp',
     transports: ['stdio', 'http'],
+    authCapabilities: {
+      automaticOAuth: true,
+      oauthDisabled: true,
+      preRegisteredOAuth: 'native-config',
+      bearerEnvironment: true,
+      customHeaderEnvironment: true,
+    },
   },
 ];
 
@@ -58,11 +94,28 @@ export interface RawTransport {
   headers?: Record<string, string>;
 }
 
+export interface RawAuth {
+  oauthMode: 'not-applicable' | 'automatic' | 'disabled' | 'pre-registered' | 'client-managed';
+  authorizationServerIssuer?: string;
+  authServerMetadataUrl?: string;
+  clientId?: string;
+  clientSecret?: string;
+  clientMetadataUrl?: string;
+  scopes?: string[];
+  resource?: string | false;
+  callbackPort?: number;
+  tokenEndpointAuthMethod?: string;
+  credentialKind: 'none' | 'bearer-environment' | 'header-environment' | 'static-headers';
+  credentialHeaderKeys: string[];
+  environmentVariables: string[];
+}
+
 export interface RawMcpOccurrence {
   occurrenceId: string;
   agentId: AgentId;
   name: string;
   transport: RawTransport;
+  auth: RawAuth;
   enabled: boolean;
   timeoutMs?: number;
   includeTools?: string[];
@@ -81,6 +134,7 @@ export interface RawMcpOccurrence {
     path: string;
     hash: string;
   }>;
+  nativePath?: (string | number)[];
   warnings: string[];
   native: Record<string, unknown>;
 }
@@ -232,6 +286,25 @@ export function buildFingerprints(transport: RawTransport, portable: unknown, fa
     ).slice(0, 20),
     identityFingerprint: sha256(stableStringify(canonicalizeReferences(identity))).slice(0, 20),
     configFingerprint: sha256(stableStringify(canonicalizeReferences(portable))).slice(0, 20),
+  };
+}
+
+export function authFingerprint(auth: RawAuth): unknown {
+  const clientSecretReference = auth.clientSecret
+    ? parsePureEnvironmentReference(auth.clientSecret)?.name
+    : undefined;
+  const oauthMode =
+    auth.credentialKind !== 'none' && (auth.oauthMode === 'automatic' || auth.oauthMode === 'disabled')
+      ? 'credential'
+      : auth.oauthMode;
+  return {
+    ...auth,
+    oauthMode,
+    clientSecret: auth.clientSecret
+      ? clientSecretReference
+        ? `{env:${clientSecretReference}}`
+        : 'configured'
+      : undefined,
   };
 }
 
@@ -390,12 +463,41 @@ export function toPublicOccurrence(occurrence: RawMcpOccurrence): PublicMcpOccur
     envKeys: Object.keys(occurrence.transport.env ?? {}).sort(),
     headerKeys: Object.keys(occurrence.transport.headers ?? {}).sort(),
   };
+  const oauthFields = [
+    occurrence.auth.authorizationServerIssuer && 'authorization server issuer',
+    occurrence.auth.authServerMetadataUrl && 'authorization metadata',
+    occurrence.auth.clientId && 'client ID',
+    occurrence.auth.clientSecret && 'client secret',
+    occurrence.auth.clientMetadataUrl && 'client metadata',
+    occurrence.auth.scopes?.length && 'scopes',
+    occurrence.auth.resource !== undefined && 'resource',
+    occurrence.auth.callbackPort !== undefined && 'callback port',
+    occurrence.auth.tokenEndpointAuthMethod && 'token endpoint method',
+  ].filter((value): value is string => Boolean(value));
+  let authKind: AuthKind;
+  if (occurrence.auth.credentialKind !== 'none') authKind = occurrence.auth.credentialKind;
+  else if (occurrence.auth.oauthMode === 'not-applicable') authKind = 'not-applicable';
+  else if (occurrence.auth.oauthMode === 'automatic') authKind = 'automatic-oauth';
+  else if (occurrence.auth.oauthMode === 'disabled') authKind = 'oauth-disabled';
+  else if (occurrence.auth.oauthMode === 'pre-registered') authKind = 'oauth-client';
+  else authKind = 'client-managed';
 
   return {
     occurrenceId: occurrence.occurrenceId,
     agentId: occurrence.agentId,
     name: occurrence.name,
     transport,
+    auth: {
+      kind: authKind,
+      oauthMode: occurrence.auth.oauthMode,
+      oauthFields,
+      environmentVariables: occurrence.auth.environmentVariables,
+      requiresTargetLogin:
+        occurrence.auth.oauthMode === 'automatic' ||
+        occurrence.auth.oauthMode === 'pre-registered' ||
+        occurrence.auth.oauthMode === 'client-managed',
+      hasClientSecret: Boolean(occurrence.auth.clientSecret),
+    },
     enabled: occurrence.enabled,
     timeoutMs: occurrence.timeoutMs,
     includeTools: occurrence.includeTools,
@@ -408,6 +510,7 @@ export function toPublicOccurrence(occurrence: RawMcpOccurrence): PublicMcpOccur
     hasSecrets:
       Object.keys(occurrence.transport.env ?? {}).length > 0 ||
       Object.keys(occurrence.transport.headers ?? {}).length > 0 ||
+      Boolean(occurrence.auth.clientSecret) ||
       args.sensitive,
   };
 }

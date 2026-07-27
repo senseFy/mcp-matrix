@@ -12,6 +12,7 @@ import {
   FileCode2,
   GitCompare,
   GripVertical,
+  KeyRound,
   Minus,
   Plus,
   RefreshCw,
@@ -25,7 +26,9 @@ import type {
   AgentId,
   AgentSnapshot,
   ApplyResult,
+  AuthUpdate,
   ChangePlan,
+  PublicAuth,
   PublicMcpOccurrence,
   SnapshotResponse,
 } from './types';
@@ -256,6 +259,17 @@ function StatusMark({ status }: { status: string }) {
   return <Check size={13} />;
 }
 
+function authLabel(auth: PublicAuth): string {
+  if (auth.kind === 'bearer-environment') return 'Bearer from environment';
+  if (auth.kind === 'header-environment') return 'Headers from environment';
+  if (auth.kind === 'static-headers') return 'Static credential headers';
+  if (auth.oauthMode === 'pre-registered') return 'OAuth client configured';
+  if (auth.oauthMode === 'disabled') return 'OAuth disabled';
+  if (auth.oauthMode === 'automatic') return 'Automatic OAuth';
+  if (auth.oauthMode === 'client-managed') return 'Client-managed login';
+  return 'Not applicable';
+}
+
 function App() {
   const [snapshot, setSnapshot] = useState<SnapshotResponse>();
   const [workspace, setWorkspace] = useState('');
@@ -268,6 +282,7 @@ function App() {
   const [applying, setApplying] = useState(false);
   const [notice, setNotice] = useState<Notice>();
   const [dragTarget, setDragTarget] = useState<string>();
+  const [authOccurrence, setAuthOccurrence] = useState<PublicMcpOccurrence>();
 
   const scan = useCallback(async (requestedWorkspace?: string) => {
     setLoading(true);
@@ -345,6 +360,31 @@ function App() {
     [snapshot],
   );
 
+  const requestAuthPlan = useCallback(
+    async (occurrenceId: string, auth: AuthUpdate) => {
+      if (!snapshot) return;
+      setPlanning(true);
+      setError(undefined);
+      try {
+        const next = await api<ChangePlan>(
+          '/api/auth-plans',
+          {
+            method: 'POST',
+            body: JSON.stringify({ workspace: snapshot.workspace, occurrenceId, auth }),
+          },
+          snapshot.mutationToken,
+        );
+        setAuthOccurrence(undefined);
+        setPlan(next);
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : 'Unable to create an authentication preview.');
+      } finally {
+        setPlanning(false);
+      }
+    },
+    [snapshot],
+  );
+
   const selectCell = (row: MatrixRow, agentId: AgentId) => {
     const occurrences = row.occurrences.get(agentId) ?? [];
     if (occurrences.length === 1) {
@@ -377,7 +417,13 @@ function App() {
         snapshot?.mutationToken,
       );
       setPlan(undefined);
-      setNotice({ message: `Added ${plan.targetName} to ${plan.targetAgentId}.`, undoToken: result.undoToken });
+      setNotice({
+        message:
+          plan.operation === 'configure-auth'
+            ? `Updated authentication for ${plan.targetName} in ${plan.targetAgentId}.`
+            : `Added ${plan.targetName} to ${plan.targetAgentId}.`,
+        undoToken: result.undoToken,
+      });
       await scan(snapshot?.workspace);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Unable to apply this change.');
@@ -660,6 +706,7 @@ function App() {
             onCompare={(occurrenceId, compareOccurrenceId, rowId, agentId) =>
               setSelection({ occurrenceId, compareOccurrenceId, rowId, agentId })
             }
+            onConfigureAuth={setAuthOccurrence}
           />
         </div>
       </div>
@@ -670,7 +717,7 @@ function App() {
             <header>
               <div>
                 <span className="eyebrow">Dry run</span>
-                <h2 id="diff-title">Add {plan.targetName}</h2>
+                <h2 id="diff-title">{plan.operation === 'configure-auth' ? 'Update authentication for' : 'Add'} {plan.targetName}</h2>
               </div>
               <button className="icon-button" type="button" onClick={() => setPlan(undefined)} disabled={applying}><X size={15} /></button>
             </header>
@@ -706,6 +753,16 @@ function App() {
         </div>
       )}
 
+      {authOccurrence && snapshot && (
+        <AuthEditor
+          occurrence={authOccurrence}
+          agent={snapshot.agents.find((value) => value.id === authOccurrence.agentId)!}
+          planning={planning}
+          onClose={() => setAuthOccurrence(undefined)}
+          onPreview={(auth) => requestAuthPlan(authOccurrence.occurrenceId, auth)}
+        />
+      )}
+
       {notice && (
         <div className="toast" role="status">
           <Check size={14} />
@@ -731,6 +788,7 @@ function Inspector({
   onCopy,
   onInspectOccurrence,
   onCompare,
+  onConfigureAuth,
 }: {
   snapshot?: SnapshotResponse;
   row?: MatrixRow;
@@ -747,6 +805,7 @@ function Inspector({
     rowId: string,
     agentId: AgentId,
   ) => void;
+  onConfigureAuth: (occurrence: PublicMcpOccurrence) => void;
 }) {
   if (occurrence && comparison) {
     const cards = [
@@ -834,6 +893,35 @@ function Inspector({
         )}
         {occurrence.transport.envKeys.length > 0 && <InspectorField label="Environment"><div className="tag-list">{occurrence.transport.envKeys.map((key) => <span key={key}>{key}=••••</span>)}</div></InspectorField>}
         {occurrence.transport.headerKeys.length > 0 && <InspectorField label="Headers"><div className="tag-list">{occurrence.transport.headerKeys.map((key) => <span key={key}>{key}: ••••</span>)}</div></InspectorField>}
+        <InspectorField label="Authentication">
+          <div className="auth-summary">
+            <span className="auth-pill"><KeyRound size={11} />{authLabel(occurrence.auth)}</span>
+            {occurrence.auth.environmentVariables.length > 0 && (
+              <div className="tag-list">
+                {occurrence.auth.environmentVariables.map((name) => <span key={name}>{name}</span>)}
+              </div>
+            )}
+            {occurrence.auth.oauthMode === 'automatic' && (
+              <small>Configuration policy only. Each agent keeps its own login session.</small>
+            )}
+            {occurrence.auth.kind === 'static-headers' && (
+              <small>Literal credentials are not portable and are never copied into another agent.</small>
+            )}
+            {occurrence.transport.kind !== 'stdio' &&
+              occurrence.transport.kind !== 'unknown' &&
+              (occurrence.source.scope === 'user' || occurrence.source.scope === 'local') && (
+              <button className="auth-configure" type="button" onClick={() => onConfigureAuth(occurrence)}>
+                Configure authentication <ArrowRight size={11} />
+              </button>
+            )}
+            {occurrence.transport.kind !== 'stdio' &&
+              occurrence.transport.kind !== 'unknown' &&
+              occurrence.source.scope !== 'user' &&
+              occurrence.source.scope !== 'local' && (
+                <small>Authentication changes are limited to private user and local configuration layers.</small>
+              )}
+          </div>
+        </InspectorField>
         <InspectorField label="Fingerprints">
           <div className="fingerprint-list">
             <span>Family <code>{occurrence.familyFingerprint.slice(0, 16)}</code></span>
@@ -974,6 +1062,183 @@ function Inspector({
         <div><strong>No proxy layer</strong><span>MCP Matrix never starts servers, handles OAuth, or intercepts agent traffic.</span></div>
       </div>
     </aside>
+  );
+}
+
+function initialAuthKind(auth: PublicAuth): AuthUpdate['kind'] {
+  if (auth.kind === 'bearer-environment') return 'bearer-environment';
+  if (auth.kind === 'header-environment') return 'header-environment';
+  if (auth.oauthMode === 'pre-registered') return 'oauth-client';
+  if (auth.oauthMode === 'disabled') return 'oauth-disabled';
+  return 'automatic-oauth';
+}
+
+function AuthEditor({
+  occurrence,
+  agent,
+  planning,
+  onClose,
+  onPreview,
+}: {
+  occurrence: PublicMcpOccurrence;
+  agent: AgentSnapshot;
+  planning: boolean;
+  onClose: () => void;
+  onPreview: (auth: AuthUpdate) => Promise<void>;
+}) {
+  const capabilities = agent.authCapabilities;
+  const supportedKinds = useMemo(() => {
+    const values: AuthUpdate['kind'][] = [];
+    if (capabilities.automaticOAuth) values.push('automatic-oauth');
+    if (capabilities.bearerEnvironment) values.push('bearer-environment');
+    if (capabilities.customHeaderEnvironment) values.push('header-environment');
+    if (capabilities.preRegisteredOAuth === 'native-config') values.push('oauth-client');
+    if (capabilities.oauthDisabled) values.push('oauth-disabled');
+    return values;
+  }, [capabilities]);
+  const currentKind = initialAuthKind(occurrence.auth);
+  const [kind, setKind] = useState<AuthUpdate['kind']>(
+    supportedKinds.includes(currentKind) ? currentKind : supportedKinds[0],
+  );
+  const [environmentVariable, setEnvironmentVariable] = useState(
+    occurrence.auth.environmentVariables[0] ?? '',
+  );
+  const [headerName, setHeaderName] = useState('X-API-Key');
+  const [prefix, setPrefix] = useState('');
+  const [issuer, setIssuer] = useState('');
+  const [clientId, setClientId] = useState('');
+  const [clientSecretEnvironmentVariable, setClientSecretEnvironmentVariable] = useState('');
+  const [scopes, setScopes] = useState('');
+  const [callbackPort, setCallbackPort] = useState('');
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    const parsedScopes = scopes.split(',').map((scope) => scope.trim()).filter(Boolean);
+    let auth: AuthUpdate;
+    if (kind === 'bearer-environment') {
+      auth = { kind, environmentVariable };
+    } else if (kind === 'header-environment') {
+      auth = { kind, headerName, environmentVariable, prefix: prefix || undefined };
+    } else if (kind === 'oauth-client') {
+      auth = {
+        kind,
+        authorizationServerIssuer: issuer || undefined,
+        clientId,
+        clientSecretEnvironmentVariable: clientSecretEnvironmentVariable || undefined,
+        scopes: parsedScopes.length ? parsedScopes : undefined,
+        callbackPort: callbackPort ? Number(callbackPort) : undefined,
+      };
+    } else if (kind === 'automatic-oauth') {
+      auth = { kind, scopes: parsedScopes.length ? parsedScopes : undefined };
+    } else {
+      auth = { kind };
+    }
+    void onPreview(auth);
+  };
+
+  const labels: Record<AuthUpdate['kind'], string> = {
+    'automatic-oauth': 'Automatic OAuth',
+    'bearer-environment': 'Bearer token from environment',
+    'header-environment': 'Custom header from environment',
+    'oauth-client': 'Pre-registered OAuth client',
+    'oauth-disabled': 'No authentication',
+  };
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={() => !planning && onClose()}>
+      <form className="auth-modal" onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
+        <header>
+          <div>
+            <span className="eyebrow">Native configuration</span>
+            <h2>Authentication for {occurrence.name}</h2>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} disabled={planning}><X size={15} /></button>
+        </header>
+        <div className="auth-route">
+          <span className="agent-token"><AgentIcon id={agent.id} size={16} />{agent.name}</span>
+          <code>{occurrence.source.path}</code>
+        </div>
+        <div className="auth-form">
+          <label>
+            <span>Strategy</span>
+            <select value={kind} onChange={(event) => setKind(event.target.value as AuthUpdate['kind'])}>
+              {supportedKinds.map((value) => <option value={value} key={value}>{labels[value]}</option>)}
+            </select>
+          </label>
+
+          {kind === 'automatic-oauth' && (
+            <p className="form-note">The agent performs its own OAuth flow and stores its own session. MCP Matrix never reads or transfers that session.</p>
+          )}
+
+          {(kind === 'bearer-environment' || kind === 'header-environment') && (
+            <TextField label="Environment variable" value={environmentVariable} onChange={setEnvironmentVariable} placeholder="MCP_API_TOKEN" required />
+          )}
+          {kind === 'bearer-environment' && (
+            <p className="form-note">Writes a Bearer Authorization header backed by the named environment variable. No token value enters this app.</p>
+          )}
+          {kind === 'header-environment' && (
+            <>
+              <TextField label="Header name" value={headerName} onChange={setHeaderName} placeholder="X-API-Key" required />
+              <TextField label="Value prefix (optional)" value={prefix} onChange={setPrefix} placeholder="Bearer " />
+            </>
+          )}
+
+          {kind === 'oauth-client' && (
+            <>
+              <TextField label={`Authorization server issuer${agent.id === 'droid' ? '' : ' (optional)'}`} value={issuer} onChange={setIssuer} placeholder="https://auth.example.com/" required={agent.id === 'droid'} />
+              <TextField label="Client ID" value={clientId} onChange={setClientId} required />
+              {agent.id === 'opencode' && <TextField label="Client secret environment variable (optional)" value={clientSecretEnvironmentVariable} onChange={setClientSecretEnvironmentVariable} placeholder="MCP_CLIENT_SECRET" />}
+              <TextField label="Scopes (comma-separated)" value={scopes} onChange={setScopes} placeholder="read, write" />
+              {(agent.id === 'droid' || agent.id === 'claude') && <TextField label="Callback port (optional)" value={callbackPort} onChange={setCallbackPort} inputMode="numeric" />}
+              <p className="form-note">Only client metadata{agent.id === 'opencode' ? ' and an optional secret environment-variable name are' : ' is'} written. Literal client secrets cannot be entered here.</p>
+            </>
+          )}
+
+          {kind === 'oauth-disabled' && (
+            <p className="form-note">Disables automatic OAuth for this server where the agent supports an explicit native switch.</p>
+          )}
+        </div>
+        <footer>
+          <div className="safety-copy"><ShieldCheck size={14} /><span>Preview first. Secret values stay outside MCP Matrix.</span></div>
+          <button className="button secondary" type="button" onClick={onClose} disabled={planning}>Cancel</button>
+          <button className="button primary" type="submit" disabled={planning}>
+            {planning ? <RefreshCw size={13} className="spin" /> : <FileCode2 size={13} />}
+            Preview patch
+          </button>
+        </footer>
+      </form>
+    </div>
+  );
+}
+
+function TextField({
+  label,
+  value,
+  onChange,
+  placeholder,
+  required,
+  inputMode,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  required?: boolean;
+  inputMode?: 'numeric';
+}) {
+  return (
+    <label>
+      <span>{label}</span>
+      <input
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
+        required={required}
+        inputMode={inputMode}
+        autoComplete="off"
+        spellCheck={false}
+      />
+    </label>
   );
 }
 
