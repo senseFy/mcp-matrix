@@ -10,6 +10,12 @@ import { loadNativeSnapshot } from './adapters';
 import { AGENTS, toPublicOccurrence } from './domain';
 import { detectAgents } from './discovery';
 import { applyPlan, createAuthPlan, createCopyPlan, undoApply } from './planner';
+import {
+  findListenHolders,
+  findReplaceableMcpMatrix,
+  maybeReplaceOccupiedPort,
+  portInUseMessage,
+} from './port';
 
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.PORT ?? 4318);
@@ -265,8 +271,8 @@ async function start(): Promise<void> {
     }
   });
 
-  try {
-    await new Promise<void>((resolveListen, rejectListen) => {
+  const listen = () =>
+    new Promise<void>((resolveListen, rejectListen) => {
       const onError = (error: Error) => rejectListen(error);
       server.once('error', onError);
       server.listen(PORT, HOST, () => {
@@ -275,6 +281,39 @@ async function start(): Promise<void> {
         resolveListen();
       });
     });
+
+  try {
+    try {
+      await listen();
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code !== 'EADDRINUSE') throw error;
+
+      const suggestedPort = PORT < 65_535 ? PORT + 1 : 4318;
+      const outcome = await maybeReplaceOccupiedPort(PORT);
+      if (outcome === 'replaced') {
+        try {
+          await listen();
+          return;
+        } catch (retryError) {
+          const retry = retryError as NodeJS.ErrnoException;
+          if (retry.code !== 'EADDRINUSE') throw retryError;
+          const holder = findReplaceableMcpMatrix(await findListenHolders(PORT));
+          const detail = new Error(portInUseMessage(PORT, suggestedPort, holder)) as NodeJS.ErrnoException;
+          detail.code = 'EADDRINUSE';
+          throw detail;
+        }
+      }
+
+      const holder = findReplaceableMcpMatrix(await findListenHolders(PORT));
+      const detail = new Error(
+        outcome === 'declined'
+          ? `Kept the running instance. Use a second copy with: mcp-matrix --port ${suggestedPort}`
+          : portInUseMessage(PORT, suggestedPort, holder),
+      ) as NodeJS.ErrnoException;
+      detail.code = 'EADDRINUSE';
+      throw detail;
+    }
   } catch (error) {
     await vite?.close();
     throw error;
@@ -285,7 +324,7 @@ void start().catch((error: NodeJS.ErrnoException) => {
   const suggestedPort = PORT < 65_535 ? PORT + 1 : 4318;
   const message =
     error.code === 'EADDRINUSE'
-      ? `Port ${PORT} is already in use. Try: mcp-matrix --port ${suggestedPort}`
+      ? error.message || portInUseMessage(PORT, suggestedPort)
       : error.code === 'EACCES'
         ? `Permission denied while binding to loopback port ${PORT}.`
         : error.message || 'Unable to start the local server.';
