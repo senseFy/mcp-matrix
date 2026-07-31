@@ -26,6 +26,30 @@
   --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
 }
 
+:root[data-theme="light"], .app-shell[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f7f8fa;
+  --panel: #ffffff;
+  --panel-raised: #f7f8fa;
+  --panel-hover: #f0f2f5;
+  --border: #dfe2e8;
+  --border-strong: #c8cdd6;
+  --text: #343841;
+  --text-strong: #17191e;
+  --muted: #68707d;
+  --subtle: #858c98;
+  --blue: #2563b8;
+  --blue-bg: #e9f2ff;
+  --green: #2f7d53;
+  --green-bg: #eaf6ef;
+  --amber: #966116;
+  --amber-bg: #fbf3e4;
+  --red: #b33e46;
+  --red-bg: #fcebed;
+  --purple: #7058b0;
+  --purple-bg: #f0ecfb;
+}
+
 * { box-sizing: border-box; }
 
 html, body, #root { width: 100%; height: 100%; margin: 0; }
@@ -85,6 +109,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 
 .activity-item.active { color: var(--text-strong); background: #17181d; }
 .activity-item.active::before { content: ""; position: absolute; left: 0; top: 8px; bottom: 8px; width: 2px; background: var(--blue); }
+.theme-toggle:hover { color: var(--text-strong); background: var(--panel-hover); }
 .matrix-glyph { width: 15px; height: 15px; display: grid; grid-template-columns: 1fr 1fr; gap: 2px; }
 .matrix-glyph i { border: 1px solid currentColor; border-radius: 1px; }
 .activity-spacer { flex: 1; }
@@ -345,6 +370,89 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .toast { position: fixed; z-index: 30; right: 13px; bottom: 13px; min-width: 310px; min-height: 40px; display: flex; align-items: center; gap: 8px; padding: 7px 8px 7px 10px; border: 1px solid #31503e; border-radius: 5px; background: #142019; color: #a9d8bb; box-shadow: 0 12px 34px #0008; font-size: 10px; }
 .toast > span { flex: 1; }.toast > button { height: 24px; display: flex; align-items: center; gap: 4px; border: 1px solid #355743; border-radius: 3px; background: #19291f; color: #a9d8bb; cursor: pointer; font-size: 9px; }
 .toast > button.toast-close { width: 23px; border: 0; background: transparent; justify-content: center; color: #72927f; }
+
+[data-theme="light"] .activity-bar { background: #f0f2f5; }
+[data-theme="light"] .activity-item.active { background: #e5e9ef; }
+[data-theme="light"] .titlebar,
+[data-theme="light"] .legend-bar,
+[data-theme="light"] .inspector-panel { background: #f7f8fa; }
+[data-theme="light"] .workspace-picker,
+[data-theme="light"] .search-box,
+[data-theme="light"] .auth-form input,
+[data-theme="light"] .auth-form select { background: #ffffff; }
+[data-theme="light"] .local-state > span { box-shadow: 0 0 0 2px #d7ecdf; }
+[data-theme="light"] .search-box:focus-within,
+[data-theme="light"] .auth-form input:focus,
+[data-theme="light"] .auth-form select:focus { border-color: #7aa4db; }
+[data-theme="light"] .error-banner { border-color: #e7b8bc; color: #9c3038; }
+[data-theme="light"] .config-issues,
+[data-theme="light"] .config-issue-list,
+[data-theme="light"] .inspector-warning { border-color: #e5c994; }
+[data-theme="light"] .config-issues,
+[data-theme="light"] .inspector-warning { color: #805116; }
+[data-theme="light"] .config-issues summary small { color: #8b704a; }
+[data-theme="light"] .config-issue strong { color: #805116; }
+[data-theme="light"] .config-issue code { color: #806a4a; }
+[data-theme="light"] .config-issue p { color: #765c38; }
+[data-theme="light"] .config-issue-list > button { border-color: #d9bd89; background: #fff9ee; color: #76501c; }
+[data-theme="light"] .matrix-header { background: #f4f5f7; }
+[data-theme="light"] .agent-header:hover,
+[data-theme="light"] .agent-header.selected,
+[data-theme="light"] .matrix-row:hover > button { background: #f2f4f7; }
+[data-theme="light"] .agent-header small { background: #e9ebef; }
+[data-theme="light"] .server-cell,
+[data-theme="light"] .matrix-cell { border-color: #e5e7eb; }
+[data-theme="light"] .server-cell.selected,
+[data-theme="light"] .matrix-cell.selected { box-shadow: inset 0 0 0 1px #6c99d4; }
+[data-theme="light"] .server-icon { color: #555c68; background: #f7f8fa; }
+[data-theme="light"] .server-copy strong,
+[data-theme="light"] .cell-copy strong { color: #2e3239; }
+[data-theme="light"] .matrix-cell.empty .cell-copy strong { color: #8c929c; }
+[data-theme="light"] .matrix-cell.drag-target { box-shadow: inset 0 0 0 1px var(--blue), inset 0 0 20px #c9def9; }
+[data-theme="light"] .disabled .status-mark { background: #eceef2; }
+[data-theme="light"] .empty .status-mark { border-color: #b8bdc7; color: #858c98; }
+[data-theme="light"] .matrix-cell.conflict .cell-copy strong { color: #805116; }
+[data-theme="light"] .dot.divergent { background: var(--purple); }
+[data-theme="light"] .agent-inspector .inspector-icon { color: #343841; }
+[data-theme="light"] .conflict-icon { border-color: #dfc18a; }
+[data-theme="light"] .comparison-summary > span { border-color: #dfc18a; }
+[data-theme="light"] .comparison-summary > span.same { border-color: #c7b9eb; }
+[data-theme="light"] .comparison-card > code { border-color: #e1e4e9; background: #f5f6f8; color: #505763; }
+[data-theme="light"] .comparison-card > div code,
+[data-theme="light"] .inspector-field > div > code,
+[data-theme="light"] .inspector-field strong,
+[data-theme="light"] .tag-list span,
+[data-theme="light"] .fingerprint-list code { color: #505763; }
+[data-theme="light"] .comparison-card > button { background: #f1f3f6; }
+[data-theme="light"] .status-pill.ok { color: #236b45; border-color: #b8ddc7; }
+[data-theme="light"] .status-pill.off { color: #626975; background: #eceef2; }
+[data-theme="light"] .inspector-field { border-color: #e5e7eb; }
+[data-theme="light"] .path-value { color: #646b76 !important; }
+[data-theme="light"] .tag-list span { background: #f1f3f6; }
+[data-theme="light"] .auth-pill { border-color: #b8d9c5; color: #286b47; background: var(--green-bg); }
+[data-theme="light"] .auth-configure,
+[data-theme="light"] .variant-action { color: #2e67a7; }
+[data-theme="light"] .auth-configure:hover { color: #1f568f; border-color: #a8bfdc; background: #edf4fc; }
+[data-theme="light"] .copy-targets button.conflict-action { color: #805116; border-color: #dfc18a; }
+[data-theme="light"] .variant-action { background: #edf4fc; }
+[data-theme="light"] .variant-action:hover { background: #e2edf9; }
+[data-theme="light"] .coverage-strip i { background: #dfe2e8; }
+[data-theme="light"] .boundary-card { border-color: #b9d8c5; background: #edf7f1; }
+[data-theme="light"] .boundary-card strong { color: #286b47; }
+[data-theme="light"] .boundary-card span { color: #5e7f6b; }
+[data-theme="light"] .diff-modal,
+[data-theme="light"] .auth-modal { background: #ffffff; box-shadow: 0 22px 70px #18223338; }
+[data-theme="light"] .plan-route code,
+[data-theme="light"] .auth-route code { color: #626a76; }
+[data-theme="light"] .plan-warnings { border-color: #dfc18a; color: #805116; }
+[data-theme="light"] .diff-view { background: #f6f7f9; color: #505763; }
+[data-theme="light"] .diff-view > span.addition { color: #276c46; background: #e7f4ec; }
+[data-theme="light"] .diff-view > span.hunk { color: #245b9b; background: #e7f0fc; }
+[data-theme="light"] .auth-form input::placeholder { color: #9aa0aa; }
+[data-theme="light"] .form-note { border-color: #dfe2e8; background: #f7f8fa; }
+[data-theme="light"] .toast { border-color: #add3bc; background: #e9f5ed; color: #286b47; box-shadow: 0 12px 34px #18223326; }
+[data-theme="light"] .toast > button { border-color: #add3bc; background: #f3faf5; color: #286b47; }
+[data-theme="light"] .toast > button.toast-close { color: #668573; }
 
 .muted { color: var(--subtle) !important; }
 .spin { animation: spin .8s linear infinite; }
