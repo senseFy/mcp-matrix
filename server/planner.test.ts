@@ -139,6 +139,55 @@ describe('safe write workflow', () => {
     await expect(readFile(plan.targetPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('writes Cursor distributions only to the global Cursor config and preserves JSONC', async () => {
+    const cursorPath = join(home, '.cursor', 'mcp.json');
+    await mkdir(join(cursorPath, '..'), { recursive: true });
+    await writeFile(cursorPath, `{
+  // keep Cursor settings
+  "settings": { "future": true },
+  "mcpServers": {}
+}
+`);
+    const plan = await createCopyPlan({
+      workspace,
+      occurrenceId: await sourceOccurrenceId(),
+      targetAgentId: 'cursor',
+    });
+
+    expect(plan.targetPath).toBe(cursorPath);
+    const applied = await applyPlan(plan.planId);
+    const content = await readFile(cursorPath, 'utf8');
+    expect(content).toContain('// keep Cursor settings');
+    expect(content).toContain('"future": true');
+    expect(content).toContain('"type": "stdio"');
+    expect(content).toContain('"portable"');
+
+    await undoApply(applied.undoToken);
+    expect(await readFile(cursorPath, 'utf8')).not.toContain('"portable"');
+  });
+
+  it('keeps Cursor environment references visible in redacted auth previews', async () => {
+    const cursorPath = join(home, '.cursor', 'mcp.json');
+    await mkdir(join(cursorPath, '..'), { recursive: true });
+    await writeFile(cursorPath, `${JSON.stringify({
+      mcpServers: {
+        remote: { type: 'http', url: 'https://mcp.example.com/mcp' },
+      },
+    })}\n`);
+    const snapshot = await loadNativeSnapshot(workspace);
+    const remote = snapshot.occurrences.find(
+      (entry) => entry.agentId === 'cursor' && entry.name === 'remote' && entry.source.effective,
+    )!;
+    const plan = await createAuthPlan({
+      workspace,
+      occurrenceId: remote.occurrenceId,
+      auth: { kind: 'bearer-environment', environmentVariable: 'NEW_TOKEN' },
+    });
+
+    expect(plan.unifiedDiff).toContain('Bearer ${env:NEW_TOKEN}');
+    expect(plan.unifiedDiff).not.toContain('Authorization": "••••••••');
+  });
+
   it('overrides credentials inherited from lower Pi adapter layers', async () => {
     const sharedPath = join(home, '.config', 'mcp', 'mcp.json');
     const piPath = join(home, '.pi', 'agent', 'mcp.json');

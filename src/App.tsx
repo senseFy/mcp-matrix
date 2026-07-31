@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState, type CSSProperties, type For
 import ampIcon from '@lobehub/icons-static-svg/icons/amp.svg?url';
 import claudeCodeIcon from '@lobehub/icons-static-svg/icons/claudecode.svg?url';
 import codexIcon from '@lobehub/icons-static-svg/icons/codex.svg?url';
+import cursorIcon from '@lobehub/icons-static-svg/icons/cursor.svg?url';
 import mcpIcon from '@lobehub/icons-static-svg/icons/mcp.svg?url';
 import openCodeIcon from '@lobehub/icons-static-svg/icons/opencode.svg?url';
 import piIcon from '@lobehub/icons-static-svg/icons/pi.svg?url';
@@ -34,7 +35,7 @@ import type {
   SnapshotResponse,
 } from './types';
 
-const AGENT_ORDER: AgentId[] = ['claude', 'codex', 'droid', 'amp', 'opencode', 'pi'];
+const AGENT_ORDER: AgentId[] = ['claude', 'codex', 'droid', 'amp', 'opencode', 'cursor', 'pi'];
 
 const DOCS: Record<AgentId, string> = {
   claude: 'https://code.claude.com/docs/en/mcp',
@@ -42,6 +43,7 @@ const DOCS: Record<AgentId, string> = {
   droid: 'https://docs.factory.ai/cli/configuration/mcp',
   amp: 'https://ampcode.com/manual#mcp-servers',
   opencode: 'https://opencode.ai/docs/mcp-servers/',
+  cursor: 'https://cursor.com/docs/mcp',
   pi: 'https://github.com/nicobailon/pi-mcp-adapter',
 };
 
@@ -93,6 +95,7 @@ function MCP({ size = 18 }: { size?: number }) {
 function AgentIcon({ id, size = 18 }: { id: AgentId; size?: number }) {
   if (id === 'claude') return <LobeIcon size={size} url={claudeCodeIcon} />;
   if (id === 'codex') return <LobeIcon size={size} url={codexIcon} />;
+  if (id === 'cursor') return <LobeIcon size={size} url={cursorIcon} />;
   if (id === 'amp') return <LobeIcon size={size} url={ampIcon} />;
   if (id === 'opencode') return <LobeIcon size={size} url={openCodeIcon} />;
   if (id === 'pi') return <LobeIcon size={size} url={piIcon} />;
@@ -1192,10 +1195,10 @@ function AuthEditor({
             <>
               <TextField label={`Authorization server issuer${agent.id === 'droid' ? '' : ' (optional)'}`} value={issuer} onChange={setIssuer} placeholder="https://auth.example.com/" required={agent.id === 'droid'} />
               <TextField label="Client ID" value={clientId} onChange={setClientId} required />
-              {(agent.id === 'opencode' || agent.id === 'pi') && <TextField label="Client secret environment variable (optional)" value={clientSecretEnvironmentVariable} onChange={setClientSecretEnvironmentVariable} placeholder="MCP_CLIENT_SECRET" />}
+              {(agent.id === 'opencode' || agent.id === 'cursor' || agent.id === 'pi') && <TextField label="Client secret environment variable (optional)" value={clientSecretEnvironmentVariable} onChange={setClientSecretEnvironmentVariable} placeholder="MCP_CLIENT_SECRET" />}
               <TextField label="Scopes (comma-separated)" value={scopes} onChange={setScopes} placeholder="read, write" />
               {(agent.id === 'droid' || agent.id === 'claude') && <TextField label="Callback port (optional)" value={callbackPort} onChange={setCallbackPort} inputMode="numeric" />}
-              <p className="form-note">Only client metadata{agent.id === 'opencode' || agent.id === 'pi' ? ' and an optional secret environment-variable name are' : ' is'} written. Literal client secrets cannot be entered here.</p>
+              <p className="form-note">Only client metadata{agent.id === 'opencode' || agent.id === 'cursor' || agent.id === 'pi' ? ' and an optional secret environment-variable name are' : ' is'} written. Literal client secrets cannot be entered here.</p>
             </>
           )}
 

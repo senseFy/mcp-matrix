@@ -60,6 +60,59 @@ describe('target-native serialization', () => {
     });
   });
 
+  it('converts portable environment references into Cursor syntax', () => {
+    const source = occurrence('opencode', {
+      kind: 'stdio',
+      command: 'node',
+      args: ['{env:SERVER_SCRIPT}'],
+      cwd: '$env:SERVER_ROOT',
+      env: { TOKEN: '${TOKEN}' },
+    });
+
+    expect(serializeForAgent('cursor', source)).toMatchObject({
+      spec: {
+        type: 'stdio',
+        command: 'node',
+        args: ['${env:SERVER_SCRIPT}'],
+        cwd: '${env:SERVER_ROOT}',
+        env: { TOKEN: '${env:TOKEN}' },
+      },
+      errors: [],
+    });
+  });
+
+  it('does not reinterpret Cursor path interpolation as another agent environment variable', () => {
+    const source = occurrence('cursor', {
+      kind: 'stdio',
+      command: 'node',
+      args: ['${workspaceFolder}/server.js'],
+    }, {
+      type: 'stdio',
+      command: 'node',
+      args: ['${workspaceFolder}/server.js'],
+    });
+
+    expect(serializeForAgent('droid', source).spec).toBeUndefined();
+    expect(serializeForAgent('droid', source).errors.join(' ')).toContain('Cursor path interpolation');
+  });
+
+  it('preserves an existing agent environment variable whose name matches a Cursor built-in', () => {
+    const source = occurrence('claude', {
+      kind: 'stdio',
+      command: 'node',
+      env: { ROOT: '${workspaceFolder}' },
+    });
+
+    expect(serializeForAgent('droid', source)).toMatchObject({
+      spec: {
+        type: 'stdio',
+        command: 'node',
+        env: { ROOT: '${workspaceFolder}' },
+      },
+      errors: [],
+    });
+  });
+
   it('blocks reference conversions that would silently change semantics', () => {
     const fileReference = occurrence('opencode', {
       kind: 'stdio',
@@ -123,6 +176,7 @@ describe('target-native serialization', () => {
     ['droid', { type: 'http', url: 'https://mcp.example.com/mcp', oauth: false, headers: { Authorization: 'Bearer ${TOKEN}' } }],
     ['amp', { url: 'https://mcp.example.com/mcp', headers: { Authorization: 'Bearer ${TOKEN}' } }],
     ['opencode', { type: 'remote', url: 'https://mcp.example.com/mcp', oauth: false, headers: { Authorization: 'Bearer {env:TOKEN}' } }],
+    ['cursor', { url: 'https://mcp.example.com/mcp', headers: { Authorization: 'Bearer ${env:TOKEN}' } }],
     ['pi', { url: 'https://mcp.example.com/mcp', auth: 'bearer', bearerTokenEnv: 'TOKEN' }],
   ] as const)('writes environment-backed bearer authentication for %s', (agentId, expected) => {
     const source = occurrence(agentId, {
@@ -185,6 +239,30 @@ describe('target-native serialization', () => {
         clientId: 'public-client-id',
         clientSecret: '${MCP_CLIENT_SECRET}',
         scope: 'read write',
+      },
+    });
+  });
+
+  it('writes Cursor static OAuth metadata with an environment-backed client secret', () => {
+    const source = occurrence('cursor', {
+      kind: 'http',
+      url: 'https://mcp.example.com/mcp',
+    }, { type: 'http', url: 'https://mcp.example.com/mcp' });
+    const result = nativeSpecWithAuthUpdate(source, {
+      kind: 'oauth-client',
+      clientId: 'public-client-id',
+      clientSecretEnvironmentVariable: 'MCP_CLIENT_SECRET',
+      scopes: ['read', 'write'],
+    });
+
+    expect(result.errors).toEqual([]);
+    expect(result.spec).toEqual({
+      type: 'http',
+      url: 'https://mcp.example.com/mcp',
+      auth: {
+        CLIENT_ID: 'public-client-id',
+        CLIENT_SECRET: '${env:MCP_CLIENT_SECRET}',
+        scopes: ['read', 'write'],
       },
     });
   });
@@ -366,6 +444,49 @@ describe('minimal native edits', () => {
     const withNewServer = addServerToContent('pi', after, 'new-server', { command: 'new-command' });
     expect((parseJsonc(withNewServer) as { 'mcp-servers': Record<string, unknown> })['mcp-servers']['new-server']).toEqual({
       command: 'new-command',
+    });
+  });
+
+  it('preserves Cursor JSONC while replacing static OAuth with an environment header', () => {
+    const before = `{
+  // keep Cursor settings
+  "theme": "dark",
+  "mcpServers": {
+    "source": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "auth": { "CLIENT_ID": "old-client", "scopes": ["read"] },
+      "futureOption": true
+    }
+  }
+}
+`;
+    const source = occurrence('cursor', {
+      kind: 'http',
+      url: 'https://mcp.example.com/mcp',
+    }, {
+      type: 'http',
+      url: 'https://mcp.example.com/mcp',
+      auth: { CLIENT_ID: 'old-client', scopes: ['read'] },
+      futureOption: true,
+    });
+    const spec = nativeSpecWithAuthUpdate(source, {
+      kind: 'bearer-environment',
+      environmentVariable: 'NEW_TOKEN',
+    }).spec!;
+    const after = updateAuthInContent('cursor', before, source, spec);
+    const parsed = parseJsonc(after) as {
+      theme: string;
+      mcpServers: Record<string, Record<string, unknown>>;
+    };
+
+    expect(after).toContain('// keep Cursor settings');
+    expect(parsed.theme).toBe('dark');
+    expect(parsed.mcpServers.source).toEqual({
+      type: 'http',
+      url: 'https://mcp.example.com/mcp',
+      headers: { Authorization: 'Bearer ${env:NEW_TOKEN}' },
+      futureOption: true,
     });
   });
 

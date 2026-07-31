@@ -65,8 +65,8 @@ function asStringRecord(value: unknown): Record<string, string> | undefined {
 }
 
 function environmentReferences(value: string): string[] {
-  return [...value.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}|\$env:([A-Za-z_][A-Za-z0-9_]*)|\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g)]
-    .map((match) => match[1] ?? match[2] ?? match[3]);
+  return [...value.matchAll(/\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}|\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}|\$env:([A-Za-z_][A-Za-z0-9_]*)|\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g)]
+    .map((match) => match[1] ?? match[2] ?? match[3] ?? match[4]);
 }
 
 function isCredentialHeader(key: string): boolean {
@@ -86,7 +86,7 @@ function credentialAuth(headers: Record<string, string> | undefined): Pick<
   )].sort();
   const bearerEnvironment = credentialEntries.length === 1 &&
     credentialEntries[0][0].toLocaleLowerCase() === 'authorization' &&
-    /^Bearer\s+(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$env:[A-Za-z_][A-Za-z0-9_]*|\{env:[A-Za-z_][A-Za-z0-9_]*\})$/.test(
+    /^Bearer\s+(?:\$\{env:[A-Za-z_][A-Za-z0-9_]*\}|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$env:[A-Za-z_][A-Za-z0-9_]*|\{env:[A-Za-z_][A-Za-z0-9_]*\})$/.test(
       credentialEntries[0][1],
     );
   return {
@@ -114,6 +114,19 @@ function normalizeJsonAuth(
 ): RawAuth {
   const auth = baseAuth(transport);
   if (auth.oauthMode === 'not-applicable' || agentId === 'amp') return auth;
+  if (agentId === 'cursor') {
+    const cursorAuth = asRecord(spec.auth);
+    if (!cursorAuth) return auth;
+    auth.clientId = asString(cursorAuth.CLIENT_ID);
+    auth.clientSecret = asString(cursorAuth.CLIENT_SECRET);
+    auth.scopes = asStringArray(cursorAuth.scopes);
+    auth.oauthMode = auth.clientId ? 'pre-registered' : 'automatic';
+    auth.environmentVariables = [...new Set([
+      ...auth.environmentVariables,
+      ...(auth.clientSecret ? environmentReferences(auth.clientSecret) : []),
+    ])].sort();
+    return auth;
+  }
   const oauthValue = spec.oauth;
   if (oauthValue === false) {
     auth.oauthMode = 'disabled';
@@ -197,6 +210,7 @@ function transportKindFromType(
   if (type === 'ws' || type === 'websocket') return agentId === 'claude' ? 'websocket' : 'unknown';
   if (type === 'http' || type === 'streamable-http') return 'http';
   if (agentId === 'amp' && !type) return /\/sse\/?(?:[?#].*)?$/i.test(url) ? 'sse' : 'http';
+  if (agentId === 'cursor' && !type) return 'http';
   return 'unknown';
 }
 
@@ -229,6 +243,8 @@ function normalizeJsonSpec(
     warnings.push(
       agentId === 'claude'
         ? 'Remote Claude Code servers require type: http, sse, or ws.'
+        : agentId === 'cursor'
+          ? 'Remote Cursor servers require type: http or sse when the transport is explicit.'
         : 'Remote Droid servers require type: http or sse.',
     );
   }
@@ -238,6 +254,12 @@ function normalizeJsonSpec(
   }
   if (agentId === 'amp' && url) {
     warnings.push('Amp auto-detects the remote transport from the endpoint.');
+  }
+  if (agentId === 'cursor') {
+    warnings.push('Cursor stores enabled and approval state outside mcp.json; Matrix reports configuration presence only.');
+    if (url && !type) {
+      warnings.push('Cursor will resolve this URL-only remote transport; add type: http or sse before copying it to another agent.');
+    }
   }
 
   const timeoutMs =
@@ -739,12 +761,39 @@ export async function loadNativeSnapshot(workspace: string): Promise<NativeSnaps
   };
 }
 
+function usesCursorPathInterpolation(source: RawMcpOccurrence): boolean {
+  const values = [
+    source.transport.command,
+    ...(source.transport.args ?? []),
+    source.transport.cwd,
+    source.transport.url,
+    ...Object.values(source.transport.env ?? {}),
+    ...Object.values(source.transport.headers ?? {}),
+  ];
+  return values.some(
+    (value) => typeof value === 'string' && /\$\{(?:userHome|workspaceFolder|workspaceFolderBasename|pathSeparator|\/)\}/.test(value),
+  );
+}
+
 function replaceReferences(
   value: string,
-  target: 'dollar' | 'amp' | 'opencode' | 'pi',
+  target: 'dollar' | 'amp' | 'opencode' | 'cursor' | 'pi',
   warnings: string[],
   errors: string[],
 ): string {
+  if (target === 'cursor') {
+    if (/\{file:[^}]+\}/.test(value)) {
+      errors.push('OpenCode {file:...} references have no portable equivalent in Cursor.');
+    }
+    if (/\$\{[A-Za-z_][A-Za-z0-9_]*:-[^}]*\}/.test(value)) {
+      errors.push('Cursor does not document support for ${VAR:-default} references.');
+    }
+    return value.replace(
+      /\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$env:([A-Za-z_][A-Za-z0-9_]*)|\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g,
+      (_match, cursorName: string | undefined, dollarName: string | undefined, piName: string | undefined, openCodeName: string | undefined) =>
+        `\${env:${cursorName ?? dollarName ?? piName ?? openCodeName}}`,
+    );
+  }
   if (target !== 'opencode') {
     if (/\{file:[^}]+\}/.test(value)) {
       errors.push('OpenCode {file:...} references have no portable equivalent in the target agent.');
@@ -753,10 +802,12 @@ function replaceReferences(
       errors.push(`${target === 'pi' ? 'pi-mcp-adapter' : 'Amp'} does not document support for \${VAR:-default} references.`);
     }
     return value
+      .replace(/\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, '${$1}')
       .replace(/\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, '${$1}')
       .replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/g, '${$1}');
   }
   return value
+    .replace(/\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, '{env:$1}')
     .replace(
       /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g,
       (_match, name: string, defaultValue: string | undefined) => {
@@ -787,7 +838,7 @@ function applyPortableExtras(
     if (target === 'droid') spec.disabled = true;
     else if (target === 'pi') spec.disabled = true;
     else if (target === 'codex' || target === 'opencode') spec.enabled = false;
-    else warnings.push(`${target === 'claude' ? 'Claude Code' : 'Amp'} stores disable state outside this server entry; the new server will be enabled.`);
+    else warnings.push(`${target === 'claude' ? 'Claude Code' : target === 'cursor' ? 'Cursor' : 'Amp'} stores disable state outside this server entry; the new server will be enabled.`);
   }
 
   if (source.timeoutMs !== undefined) {
@@ -795,7 +846,7 @@ function applyPortableExtras(
     else if (target === 'droid') spec.timeoutMs = source.timeoutMs;
     else if (target === 'codex') spec.tool_timeout_sec = source.timeoutMs / 1_000;
     else if (target === 'pi') spec.requestTimeoutMs = source.timeoutMs;
-    else warnings.push(`${target === 'opencode' ? 'OpenCode timeout controls tool discovery' : 'Amp has no equivalent timeout field'}; the source tool-call timeout was omitted.`);
+    else warnings.push(`${target === 'opencode' ? 'OpenCode timeout controls tool discovery' : `${target === 'cursor' ? 'Cursor' : 'Amp'} has no equivalent timeout field`}; the source tool-call timeout was omitted.`);
   }
 
   if (source.includeTools?.length) {
@@ -847,6 +898,7 @@ const mappedNativeKeys: Record<AgentId, Set<string>> = {
   ]),
   amp: new Set(['command', 'args', 'url', 'env', 'headers', 'includeTools']),
   opencode: new Set(['type', 'command', 'cwd', 'url', 'environment', 'headers', 'oauth', 'enabled']),
+  cursor: new Set(['type', 'command', 'args', 'cwd', 'url', 'env', 'headers', 'auth']),
   pi: new Set([
     'command',
     'args',
@@ -881,7 +933,7 @@ function warnAboutClientSpecificFields(source: RawMcpOccurrence, warnings: strin
 }
 
 function isReferenceBacked(value: string): boolean {
-  return /^(?:(?:Bearer|Basic|token)\s+)?(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$env:[A-Za-z_][A-Za-z0-9_]*|\{env:[A-Za-z_][A-Za-z0-9_]*\}|\{file:[^}]+\})$/i.test(
+  return /^(?:(?:Bearer|Basic|token)\s+)?(?:\$\{env:[A-Za-z_][A-Za-z0-9_]*\}|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$env:[A-Za-z_][A-Za-z0-9_]*|\{env:[A-Za-z_][A-Za-z0-9_]*\}|\{file:[^}]+\})$/i.test(
     value,
   );
 }
@@ -1005,6 +1057,12 @@ function serializeCodex(source: RawMcpOccurrence): NativeSerialization {
   warnAboutClientSpecificFields(source, warnings);
   rejectLiteralSecrets(source, errors);
   rejectPiCommandProviders(source, errors);
+  if (source.agentId === 'cursor' && usesCursorPathInterpolation(source)) {
+    errors.push('Cursor path interpolation has no portable equivalent in Codex.');
+  }
+  if (source.agentId === 'cursor' && source.transport.url && !asString(source.native.type)) {
+    errors.push('Cursor did not declare whether this URL-only server uses Streamable HTTP or legacy SSE; add type before copying it to Codex.');
+  }
   if (source.transport.kind === 'sse' || source.transport.kind === 'websocket') {
     errors.push('Codex supports stdio and Streamable HTTP, not this legacy remote transport.');
     return { warnings, errors };
@@ -1039,11 +1097,12 @@ function serializeCodex(source: RawMcpOccurrence): NativeSerialization {
     const environmentHeaders: Record<string, string> = {};
     for (const [key, value] of Object.entries(source.transport.headers ?? {})) {
       const bearer = value.match(/^Bearer\s+\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/);
+      const cursorBearer = value.match(/^Bearer\s+\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/);
       const piBearer = value.match(/^Bearer\s+\$env:([A-Za-z_][A-Za-z0-9_]*)$/);
       const openCodeBearer = value.match(/^Bearer\s+\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/);
       const reference = parsePureEnvironmentReference(value);
-      if (key.toLocaleLowerCase() === 'authorization' && (bearer || piBearer || openCodeBearer)) {
-        spec.bearer_token_env_var = (bearer ?? piBearer ?? openCodeBearer)![1];
+      if (key.toLocaleLowerCase() === 'authorization' && (bearer || cursorBearer || piBearer || openCodeBearer)) {
+        spec.bearer_token_env_var = (bearer ?? cursorBearer ?? piBearer ?? openCodeBearer)![1];
       } else if (reference && reference.defaultValue === undefined) {
         environmentHeaders[key] = reference.name;
       } else if (/\$\{|\$env:|\{env:|\{file:/.test(value)) {
@@ -1071,8 +1130,15 @@ export function serializeForAgent(target: AgentId, source: RawMcpOccurrence): Na
   rejectLiteralSecrets(source, errors);
   rejectPiCommandProviders(source, errors);
   const isRemote = source.transport.kind !== 'stdio';
+  const cursorAutoRemote = source.agentId === 'cursor' && Boolean(source.transport.url) && !asString(source.native.type);
 
   if (source.transport.kind === 'unknown') errors.push('The source transport is invalid or unknown.');
+  if (source.agentId === 'cursor' && target !== 'cursor' && usesCursorPathInterpolation(source)) {
+    errors.push('Cursor path interpolation has no portable equivalent in the target agent.');
+  }
+  if (cursorAutoRemote && target !== 'cursor') {
+    errors.push('Cursor did not declare whether this URL-only server uses Streamable HTTP or legacy SSE; add type before copying it to another agent.');
+  }
   if (source.transport.kind === 'websocket' && target !== 'claude') {
     errors.push(`${target} does not expose a WebSocket MCP configuration.`);
   }
@@ -1087,6 +1153,8 @@ export function serializeForAgent(target: AgentId, source: RawMcpOccurrence): Na
     ? 'opencode'
     : target === 'amp'
       ? 'amp'
+      : target === 'cursor'
+        ? 'cursor'
       : target === 'pi'
         ? 'pi'
         : 'dollar';
@@ -1114,10 +1182,10 @@ export function serializeForAgent(target: AgentId, source: RawMcpOccurrence): Na
     const headers = mapStringRecord(source.transport.headers, transform);
     if (headers) spec.headers = headers;
   } else {
-    if (target === 'claude' || target === 'droid') spec.type = 'stdio';
+    if (target === 'claude' || target === 'droid' || target === 'cursor') spec.type = 'stdio';
     spec.command = source.transport.command ? transform(source.transport.command) : undefined;
     if (source.transport.args?.length) spec.args = source.transport.args.map(transform);
-    if (source.transport.cwd && (target === 'claude' || target === 'pi')) spec.cwd = transform(source.transport.cwd);
+    if (source.transport.cwd && (target === 'claude' || target === 'cursor' || target === 'pi')) spec.cwd = transform(source.transport.cwd);
     else if (source.transport.cwd) warnings.push(`${target} has no documented portable cwd field; cwd was omitted.`);
     const env = mapStringRecord(source.transport.env, transform);
     if (env) spec.env = env;
@@ -1220,13 +1288,16 @@ function applyJsonAuthUpdate(
   else if (layeredPi) spec.headers = {};
   else delete spec.headers;
   delete spec.oauth;
-  if (agentId === 'pi') {
+  if (agentId === 'cursor' || agentId === 'pi') {
     delete spec.auth;
+  }
+  if (agentId === 'pi') {
     delete spec.bearerToken;
     delete spec.bearerTokenEnv;
   }
 
-  const environmentReference = (name: string) => agentId === 'opencode' ? `{env:${name}}` : `\${${name}}`;
+  const environmentReference = (name: string) =>
+    agentId === 'opencode' ? `{env:${name}}` : agentId === 'cursor' ? `\${env:${name}}` : `\${${name}}`;
   if (update.kind === 'bearer-environment') {
     validateEnvironmentVariable(update.environmentVariable);
     if (agentId === 'pi') {
@@ -1272,6 +1343,9 @@ function applyJsonAuthUpdate(
     } else if (agentId === 'opencode') {
       if (update.scopes?.length) oauth.scope = update.scopes.join(' ');
       if (update.resource) warnings.push('OpenCode has no documented OAuth resource override; it was omitted.');
+    } else if (agentId === 'cursor') {
+      if (update.scopes?.length) warnings.push('Cursor discovers automatic OAuth scopes from server metadata; the supplied scopes were omitted.');
+      if (update.resource) warnings.push('Cursor has no documented per-server OAuth resource override; it was omitted.');
     } else if (agentId === 'pi') {
       spec.auth = 'oauth';
       if (update.scopes?.length) oauth.scope = update.scopes.join(' ');
@@ -1285,6 +1359,22 @@ function applyJsonAuthUpdate(
 
   if (agentId === 'amp') {
     errors.push('Amp stores pre-registered OAuth clients outside amp.mcpServers; use amp mcp oauth login.');
+    return spec;
+  }
+  if (agentId === 'cursor') {
+    const auth: UnknownRecord = { CLIENT_ID: update.clientId };
+    if (update.clientSecretEnvironmentVariable) {
+      validateEnvironmentVariable(update.clientSecretEnvironmentVariable);
+      auth.CLIENT_SECRET = `\${env:${update.clientSecretEnvironmentVariable}}`;
+    }
+    if (update.scopes?.length) auth.scopes = update.scopes;
+    if (update.authorizationServerIssuer) {
+      warnings.push('Cursor discovers the authorization server and has no issuer override; the supplied issuer was omitted.');
+    }
+    if (update.callbackPort !== undefined) {
+      warnings.push('Cursor uses fixed OAuth callback URLs; the supplied callback port was omitted.');
+    }
+    spec.auth = auth;
     return spec;
   }
   if (agentId === 'pi') {
@@ -1424,6 +1514,8 @@ function updateJsonAuthInContent(
   const basePath = occurrence.nativePath ?? jsonPathForAgent(agentId, occurrence.name);
   const keys = agentId === 'pi'
     ? ['headers', 'auth', 'bearerToken', 'bearerTokenEnv', 'oauth']
+    : agentId === 'cursor'
+      ? ['headers', 'auth']
     : ['headers', 'oauth'];
   for (const key of keys) {
     output = applyEdits(

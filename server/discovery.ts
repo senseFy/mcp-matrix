@@ -57,6 +57,11 @@ const definitions: Record<AgentId, { label: string; command: string; userPath: (
     command: 'opencode',
     userPath: () => join(homeDirectory(), '.config', 'opencode', 'opencode.json'),
   },
+  cursor: {
+    label: 'Cursor',
+    command: 'agent',
+    userPath: () => join(homeDirectory(), '.cursor', 'mcp.json'),
+  },
   pi: {
     label: 'Pi',
     command: 'pi',
@@ -330,6 +335,20 @@ export async function discoverConfigSources(workspaceInput: string): Promise<Nat
     sources.push({
       agentId: 'opencode',
       path: openCodeProject,
+      scope: 'project',
+      precedence: 200,
+    });
+  }
+
+  const cursorUser = await userTargetPath('cursor');
+  if (await fileExists(cursorUser)) {
+    sources.push({ agentId: 'cursor', path: cursorUser, scope: 'user', precedence: 100 });
+  }
+  const cursorProject = await nearestConfig(workspace, repositoryRoot, [join('.cursor', 'mcp.json')]);
+  if (cursorProject && cursorProject !== cursorUser) {
+    sources.push({
+      agentId: 'cursor',
+      path: cursorProject,
       scope: 'project',
       precedence: 200,
     });

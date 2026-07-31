@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { loadNativeSnapshot } from './adapters';
+import { loadNativeSnapshot, serializeForAgent } from './adapters';
 
 let root: string;
 let home: string;
@@ -40,7 +40,7 @@ afterEach(async () => {
 });
 
 describe('native discovery and normalization', () => {
-  it('reads all six agents and merges layered MCP fields by native precedence', async () => {
+  it('reads all seven agents and merges layered MCP fields by native precedence', async () => {
     await json(join(home, '.claude.json'), {
       mcpServers: {
         'claude-user': { type: 'http', url: 'https://claude.example/mcp' },
@@ -82,6 +82,15 @@ describe('native discovery and normalization', () => {
     await json(join(workspace, 'opencode.json'), {
       mcp: { shared: { enabled: false } },
     });
+    await json(join(home, '.cursor', 'mcp.json'), {
+      mcpServers: {
+        cursor: {
+          type: 'http',
+          url: 'https://cursor.example/mcp',
+          headers: { Authorization: 'Bearer ${env:CURSOR_TOKEN}' },
+        },
+      },
+    });
     await json(join(home, '.pi', 'agent', 'mcp.json'), {
       mcpServers: {
         pi: {
@@ -103,7 +112,7 @@ describe('native discovery and normalization', () => {
 
     expect(snapshot.issues).toEqual([]);
     expect(new Set(effective.map((entry) => entry.agentId))).toEqual(
-      new Set(['claude', 'codex', 'droid', 'amp', 'opencode', 'pi']),
+      new Set(['claude', 'codex', 'droid', 'amp', 'opencode', 'cursor', 'pi']),
     );
     expect(openCode).toMatchObject({
       enabled: false,
@@ -124,6 +133,18 @@ describe('native discovery and normalization', () => {
     });
     expect(codex?.warnings.join(' ')).toContain('merges 2 Codex TOML');
     expect(codex?.sourceRevisions).toHaveLength(2);
+    const cursor = effective.find((entry) => entry.agentId === 'cursor' && entry.name === 'cursor');
+    expect(cursor).toMatchObject({
+      enabled: true,
+      transport: {
+        kind: 'http',
+        url: 'https://cursor.example/mcp',
+        headers: { Authorization: 'Bearer ${env:CURSOR_TOKEN}' },
+      },
+      auth: { credentialKind: 'bearer-environment', environmentVariables: ['CURSOR_TOKEN'] },
+      source: { scope: 'user', path: join(home, '.cursor', 'mcp.json') },
+    });
+    expect(cursor?.warnings.join(' ')).toContain('outside mcp.json');
     const pi = effective.find((entry) => entry.agentId === 'pi' && entry.name === 'pi');
     expect(pi).toMatchObject({
       enabled: false,
@@ -184,6 +205,51 @@ describe('native discovery and normalization', () => {
     expect(broken?.warnings.join(' ')).toContain('require type');
   });
 
+  it('discovers the nearest Cursor project config without merging same-name user fields', async () => {
+    await json(join(home, '.cursor', 'mcp.json'), {
+      mcpServers: {
+        shared: {
+          type: 'stdio',
+          command: 'user-command',
+          env: { USER_ONLY: 'value' },
+        },
+      },
+    });
+    await json(join(workspace, '.cursor', 'mcp.json'), {
+      mcpServers: {
+        shared: { type: 'stdio', command: 'project-command' },
+      },
+    });
+
+    const snapshot = await loadNativeSnapshot(workspace);
+    const cursorSources = snapshot.sources.filter((source) => source.agentId === 'cursor');
+    const effective = snapshot.occurrences.find(
+      (entry) => entry.agentId === 'cursor' && entry.name === 'shared' && entry.source.effective,
+    );
+
+    expect(cursorSources).toHaveLength(2);
+    expect(effective).toMatchObject({
+      transport: { kind: 'stdio', command: 'project-command', env: undefined },
+      source: { scope: 'project', path: join(workspace, '.cursor', 'mcp.json') },
+    });
+  });
+
+  it('accepts Cursor URL-only remote config but blocks transport guessing during distribution', async () => {
+    await json(join(home, '.cursor', 'mcp.json'), {
+      mcpServers: { remote: { url: 'https://cursor.example/mcp' } },
+    });
+
+    const snapshot = await loadNativeSnapshot(workspace);
+    const remote = snapshot.occurrences.find(
+      (entry) => entry.agentId === 'cursor' && entry.name === 'remote',
+    );
+
+    expect(remote?.transport.kind).toBe('http');
+    expect(remote?.warnings.join(' ')).toContain('add type: http or sse');
+    expect(serializeForAgent('claude', remote!).spec).toBeUndefined();
+    expect(serializeForAgent('claude', remote!).errors.join(' ')).toContain('did not declare');
+  });
+
   it('normalizes native authentication strategies without reading runtime sessions', async () => {
     await json(join(home, '.claude.json'), {
       mcpServers: {
@@ -223,6 +289,19 @@ describe('native discovery and normalization', () => {
         },
       },
     });
+    await json(join(home, '.cursor', 'mcp.json'), {
+      mcpServers: {
+        cursor: {
+          type: 'http',
+          url: 'https://cursor.example/mcp',
+          auth: {
+            CLIENT_ID: 'public-client',
+            CLIENT_SECRET: '${env:CURSOR_CLIENT_SECRET}',
+            scopes: ['read'],
+          },
+        },
+      },
+    });
     await json(join(home, '.pi', 'agent', 'mcp.json'), {
       mcpServers: {
         pi: {
@@ -245,6 +324,12 @@ describe('native discovery and normalization', () => {
     expect(auth.droid).toMatchObject({ oauthMode: 'disabled', credentialKind: 'bearer-environment' });
     expect(auth.amp).toMatchObject({ credentialKind: 'header-environment', environmentVariables: ['AMP_KEY'] });
     expect(auth.opencode).toMatchObject({ oauthMode: 'pre-registered', credentialKind: 'none' });
+    expect(auth.cursor).toMatchObject({
+      oauthMode: 'pre-registered',
+      credentialKind: 'none',
+      environmentVariables: ['CURSOR_CLIENT_SECRET'],
+      scopes: ['read'],
+    });
     expect(auth.pi).toMatchObject({ credentialKind: 'bearer-environment', environmentVariables: ['PI_TOKEN'] });
   });
 });

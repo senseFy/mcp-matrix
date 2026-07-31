@@ -108,6 +108,8 @@ function defaultTargetPath(agentId: AgentId): string {
       return join(home, '.config', 'amp', 'settings.json');
     case 'opencode':
       return join(process.env.XDG_CONFIG_HOME ?? join(home, '.config'), 'opencode', 'opencode.json');
+    case 'cursor':
+      return join(home, '.cursor', 'mcp.json');
     case 'pi':
       return join(piAgentDirectory(), 'mcp.json');
   }
@@ -137,7 +139,7 @@ function redactNativeSpec(value: unknown, parentKey = ''): unknown {
         }
         if (sensitiveContainer) {
           const reference = typeof entry === 'string'
-            ? entry.match(/^([^{}$\r\n]{0,64})(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$env:[A-Za-z_][A-Za-z0-9_]*|\{env:[A-Za-z_][A-Za-z0-9_]*\})$/)
+            ? entry.match(/^([^{}$\r\n]{0,64})(?:\$\{env:[A-Za-z_][A-Za-z0-9_]*\}|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$env:[A-Za-z_][A-Za-z0-9_]*|\{env:[A-Za-z_][A-Za-z0-9_]*\})$/)
             : undefined;
           const isReference = Boolean(reference && !looksLikeLiteralSecret('', reference[1]));
           return [key, isReference ? entry : '••••••••'];
@@ -197,6 +199,8 @@ function focusedDiff(agentId: AgentId, targetPath: string, name: string, spec: R
 function authPreviewSpec(agentId: AgentId, spec: Record<string, unknown>): Record<string, unknown> {
   const keys = agentId === 'codex'
     ? ['bearer_token_env_var', 'http_headers', 'env_http_headers', 'auth', 'scopes', 'oauth_resource']
+    : agentId === 'cursor'
+      ? ['headers', 'auth']
     : agentId === 'pi'
       ? ['headers', 'auth', 'bearerToken', 'bearerTokenEnv', 'oauth']
       : ['headers', 'oauth'];
