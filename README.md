@@ -25,8 +25,10 @@ MCP Matrix is deliberately **not** an MCP proxy, gateway, registry, or runtime.
 - Factory Droid
 - Amp
 - OpenCode
+- Cursor
+- Pi, through the third-party [`pi-mcp-adapter`](https://github.com/nicobailon/pi-mcp-adapter) extension
 
-See [the official-client compatibility notes](docs/official-client-matrix.md) for the exact native formats and documented limitations.
+Pi core deliberately does not include MCP. MCP Matrix supports the configuration consumed by `pi-mcp-adapter`; the extension must be installed separately for Pi to use it. See [the client compatibility notes](docs/official-client-matrix.md) for the exact native formats and documented limitations.
 
 ## Install
 
@@ -95,6 +97,8 @@ npm run build
 - Literal token-like environment values, authorization headers, credential-bearing URLs, and token arguments are read-only: copy plans require a portable environment/file reference instead of duplicating the credential.
 - Legacy SSE cannot be copied to Codex or OpenCode because neither current native schema exposes an explicit legacy SSE transport.
 - An environment reference is copied to Codex only when its native `env_vars`, `env_http_headers`, or `bearer_token_env_var` representation preserves the same meaning.
+- Cursor distribution writes only to `~/.cursor/mcp.json`; project `.cursor/mcp.json` files are read-only. Cursor-owned enablement, approval, enterprise policy, and OAuth sessions stay outside Matrix. URL-only remote entries must declare `type: "http"` or `type: "sse"` before Matrix will copy them to another agent.
+- Pi distribution writes only to `$PI_CODING_AGENT_DIR/mcp.json` (or `~/.pi/agent/mcp.json`), never to the adapter's shared global inputs. Compatibility `imports`, host-config fallback discovery, and the adapter-specific `rmcp-mux` socket transport are read-only/out of scope; distribute an explicit command or URL entry instead.
 - Factory Droid currently has no dedicated LobeHub icon. The UI uses LobeHub's neutral `MCP` icon as an explicit fallback rather than importing a logo from another source.
 
 ## Contributing and security
@@ -105,4 +109,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) before changing an adapter or write path.
 
 MCP Matrix is released under the [MIT License](LICENSE). Third-party components retain their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-MCP Matrix is an independent project and is not affiliated with, endorsed by, or sponsored by Anthropic, OpenAI, Factory, Sourcegraph, OpenCode, or LobeHub. Product names, logos, and trademarks belong to their respective owners.
+MCP Matrix is an independent project and is not affiliated with, endorsed by, or sponsored by Anthropic, OpenAI, Factory, Sourcegraph, OpenCode, Cursor, Pi, pi-mcp-adapter, or LobeHub. Product names, logos, and trademarks belong to their respective owners.

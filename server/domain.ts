@@ -82,6 +82,34 @@ export const AGENTS: AgentDefinition[] = [
       customHeaderEnvironment: true,
     },
   },
+  {
+    id: 'cursor',
+    name: 'Cursor',
+    shortName: 'Cursor',
+    configKey: 'mcpServers',
+    transports: ['stdio', 'http', 'sse'],
+    authCapabilities: {
+      automaticOAuth: true,
+      oauthDisabled: false,
+      preRegisteredOAuth: 'native-config',
+      bearerEnvironment: true,
+      customHeaderEnvironment: true,
+    },
+  },
+  {
+    id: 'pi',
+    name: 'Pi (pi-mcp-adapter)',
+    shortName: 'Pi',
+    configKey: 'mcpServers',
+    transports: ['stdio', 'http', 'sse'],
+    authCapabilities: {
+      automaticOAuth: true,
+      oauthDisabled: true,
+      preRegisteredOAuth: 'native-config',
+      bearerEnvironment: true,
+      customHeaderEnvironment: true,
+    },
+  },
 ];
 
 export interface RawTransport {
@@ -320,11 +348,13 @@ function canonicalizeReferences(value: unknown): unknown {
   }
   if (typeof value !== 'string') return value;
   return value
+    .replace(/\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, '{env:$1}')
     .replace(
       /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g,
       (_match, name: string, defaultValue: string | undefined) =>
         defaultValue === undefined ? `{env:${name}}` : `{env:${name}|default:${defaultValue}}`,
-    );
+    )
+    .replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/g, '{env:$1}');
 }
 
 export function buildOccurrenceId(
@@ -337,7 +367,9 @@ export function buildOccurrenceId(
 }
 
 const referencePatterns = [
+  /^\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/,
   /^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}$/,
+  /^\$env:([A-Za-z_][A-Za-z0-9_]*)$/,
   /^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/,
 ];
 
@@ -447,7 +479,7 @@ export function toPublicOccurrence(occurrence: RawMcpOccurrence): PublicMcpOccur
           .slice(0, 16);
       }
     } catch {
-      endpointOrigin = /\$\{|\{env:|\{file:/.test(occurrence.transport.url)
+      endpointOrigin = /\$\{|\$env:|\{env:|\{file:/.test(occurrence.transport.url)
         ? 'Templated endpoint'
         : 'Invalid endpoint';
     }

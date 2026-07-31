@@ -161,7 +161,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .config-issue-list > button:disabled { opacity: .5; cursor: wait; }
 
 .matrix-scroll { min-height: 0; flex: 1; overflow: auto; }
-.matrix-table { min-width: 840px; display: grid; grid-template-columns: minmax(190px, 1.3fr) repeat(5, minmax(124px, 1fr)); align-content: start; }
+.matrix-table { min-width: 1088px; display: grid; grid-template-columns: minmax(190px, 1.3fr) repeat(7, minmax(124px, 1fr)); align-content: start; }
 
 .matrix-header { position: sticky; top: 0; z-index: 3; height: 40px; border: 0; border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); background: #15161a; color: var(--muted); }
 .matrix-header:last-of-type { border-right: 0; }
@@ -184,7 +184,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .row-warning { color: var(--amber); flex: 0 0 auto; }
 
 .matrix-cell { position: relative; display: flex; align-items: center; gap: 7px; padding: 0 7px 0 9px; }
-.matrix-cell:nth-child(6n) { border-right: 0; }
+.matrix-cell:nth-child(7n) { border-right: 0; }
 .matrix-cell:hover { background-color: var(--panel-hover) !important; }
 .matrix-cell.empty { color: var(--subtle); }
 .matrix-cell.empty .cell-copy strong { color: #70747e; }
@@ -292,7 +292,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .variant-action.present { color: var(--green); background: var(--green-bg); }
 .variant-action.conflict-action { color: var(--amber); background: var(--amber-bg); }
 
-.coverage-strip { display: grid; grid-template-columns: repeat(5, 1fr); gap: 3px; padding: 10px 12px 2px; }
+.coverage-strip { display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; padding: 10px 12px 2px; }
 .coverage-strip i { height: 3px; border-radius: 1px; background: #292b31; }.coverage-strip i.covered { background: var(--green); }
 .docs-link { margin: 11px 12px; height: 28px; display: flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--border); border-radius: 4px; color: var(--muted); text-decoration: none; font-size: 10px; }
 .docs-link:hover { color: var(--text); border-color: var(--border-strong); }

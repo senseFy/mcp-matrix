@@ -17,7 +17,8 @@
     "model-context-protocol",
     "coding-agents",
     "claude-code",
-    "codex"
+    "codex",
+    "pi-agent"
   ],
   "engines": {
     "node": ">=20.19.0"

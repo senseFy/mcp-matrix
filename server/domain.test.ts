@@ -75,8 +75,12 @@ describe('public MCP occurrence redaction', () => {
   it('treats equivalent client-specific environment reference syntax as one identity', () => {
     const dollar = { kind: 'stdio' as const, command: 'node', args: ['${SCRIPT_PATH}'] };
     const openCode = { kind: 'stdio' as const, command: 'node', args: ['{env:SCRIPT_PATH}'] };
+    const cursor = { kind: 'stdio' as const, command: 'node', args: ['${env:SCRIPT_PATH}'] };
+    const pi = { kind: 'stdio' as const, command: 'node', args: ['$env:SCRIPT_PATH'] };
 
     expect(buildFingerprints(dollar, dollar)).toEqual(buildFingerprints(openCode, openCode));
+    expect(buildFingerprints(dollar, dollar)).toEqual(buildFingerprints(cursor, cursor));
+    expect(buildFingerprints(dollar, dollar)).toEqual(buildFingerprints(pi, pi));
   });
 
   it('treats oauth:false as the same effective strategy when credential headers are configured', () => {

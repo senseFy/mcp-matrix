@@ -1,4 +1,4 @@
-export const AGENT_IDS = ['claude', 'codex', 'droid', 'amp', 'opencode'] as const;
+export const AGENT_IDS = ['claude', 'codex', 'droid', 'amp', 'opencode', 'cursor', 'pi'] as const;
 
 export type AgentId = (typeof AGENT_IDS)[number];
 export type TransportKind = 'stdio' | 'http' | 'sse' | 'websocket' | 'unknown';

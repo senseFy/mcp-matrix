@@ -52,13 +52,14 @@ beforeEach(async () => {
 }
 `;
   await writeFile(targetPath, targetBefore);
-  for (const key of ['MCP_MATRIX_HOME', 'XDG_CONFIG_HOME', 'CODEX_HOME', 'OPENCODE_CONFIG']) {
+  for (const key of ['MCP_MATRIX_HOME', 'XDG_CONFIG_HOME', 'CODEX_HOME', 'OPENCODE_CONFIG', 'PI_CODING_AGENT_DIR']) {
     originalEnvironment[key] = process.env[key];
   }
   process.env.MCP_MATRIX_HOME = home;
   process.env.XDG_CONFIG_HOME = join(home, '.config');
   delete process.env.CODEX_HOME;
   delete process.env.OPENCODE_CONFIG;
+  delete process.env.PI_CODING_AGENT_DIR;
 });
 
 afterEach(async () => {
@@ -109,6 +110,130 @@ describe('safe write workflow', () => {
 
     await expect(applyPlan(plan.planId)).rejects.toThrow('changed after this preview');
     expect(await readFile(targetPath, 'utf8')).toBe(externalEdit);
+  });
+
+  it('writes Pi distributions only to the Pi-owned agent directory', async () => {
+    const piDirectory = join(root, 'custom-pi-agent');
+    process.env.PI_CODING_AGENT_DIR = piDirectory;
+    const sharedPath = join(home, '.config', 'mcp', 'mcp.json');
+    await mkdir(join(sharedPath, '..'), { recursive: true });
+    await writeFile(sharedPath, '{"mcpServers":{"shared":{"command":"shared-command"}}}\n');
+    const plan = await createCopyPlan({
+      workspace,
+      occurrenceId: await sourceOccurrenceId(),
+      targetAgentId: 'pi',
+    });
+
+    expect(plan.targetPath).toBe(join(piDirectory, 'mcp.json'));
+    const applied = await applyPlan(plan.planId);
+    const configured = JSON.parse(await readFile(plan.targetPath, 'utf8')) as {
+      mcpServers: Record<string, Record<string, unknown>>;
+    };
+    expect(configured.mcpServers.portable).toMatchObject({
+      command: 'npx',
+      args: ['-y', '@example/server'],
+    });
+    expect(await readFile(sharedPath, 'utf8')).toContain('shared-command');
+
+    await undoApply(applied.undoToken);
+    await expect(readFile(plan.targetPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('writes Cursor distributions only to the global Cursor config and preserves JSONC', async () => {
+    const cursorPath = join(home, '.cursor', 'mcp.json');
+    await mkdir(join(cursorPath, '..'), { recursive: true });
+    await writeFile(cursorPath, `{
+  // keep Cursor settings
+  "settings": { "future": true },
+  "mcpServers": {}
+}
+`);
+    const plan = await createCopyPlan({
+      workspace,
+      occurrenceId: await sourceOccurrenceId(),
+      targetAgentId: 'cursor',
+    });
+
+    expect(plan.targetPath).toBe(cursorPath);
+    const applied = await applyPlan(plan.planId);
+    const content = await readFile(cursorPath, 'utf8');
+    expect(content).toContain('// keep Cursor settings');
+    expect(content).toContain('"future": true');
+    expect(content).toContain('"type": "stdio"');
+    expect(content).toContain('"portable"');
+
+    await undoApply(applied.undoToken);
+    expect(await readFile(cursorPath, 'utf8')).not.toContain('"portable"');
+  });
+
+  it('keeps Cursor environment references visible in redacted auth previews', async () => {
+    const cursorPath = join(home, '.cursor', 'mcp.json');
+    await mkdir(join(cursorPath, '..'), { recursive: true });
+    await writeFile(cursorPath, `${JSON.stringify({
+      mcpServers: {
+        remote: { type: 'http', url: 'https://mcp.example.com/mcp' },
+      },
+    })}\n`);
+    const snapshot = await loadNativeSnapshot(workspace);
+    const remote = snapshot.occurrences.find(
+      (entry) => entry.agentId === 'cursor' && entry.name === 'remote' && entry.source.effective,
+    )!;
+    const plan = await createAuthPlan({
+      workspace,
+      occurrenceId: remote.occurrenceId,
+      auth: { kind: 'bearer-environment', environmentVariable: 'NEW_TOKEN' },
+    });
+
+    expect(plan.unifiedDiff).toContain('Bearer ${env:NEW_TOKEN}');
+    expect(plan.unifiedDiff).not.toContain('Authorization": "••••••••');
+  });
+
+  it('overrides credentials inherited from lower Pi adapter layers', async () => {
+    const sharedPath = join(home, '.config', 'mcp', 'mcp.json');
+    const piPath = join(home, '.pi', 'agent', 'mcp.json');
+    await mkdir(join(sharedPath, '..'), { recursive: true });
+    await mkdir(join(piPath, '..'), { recursive: true });
+    await writeFile(sharedPath, `${JSON.stringify({
+      mcpServers: {
+        layered: {
+          url: 'https://mcp.example.com/mcp',
+          headers: { 'X-API-Key': '${OLD_API_KEY}' },
+          auth: 'bearer',
+          bearerToken: '${OLD_BEARER_TOKEN}',
+          oauth: { clientId: 'old-client' },
+        },
+      },
+    })}\n`);
+    await writeFile(piPath, '{"mcpServers":{"layered":{"requestTimeoutMs":30000}}}\n');
+    const snapshot = await loadNativeSnapshot(workspace);
+    const layered = snapshot.occurrences.find(
+      (entry) => entry.agentId === 'pi' && entry.name === 'layered' && entry.source.effective,
+    )!;
+    const plan = await createAuthPlan({
+      workspace,
+      occurrenceId: layered.occurrenceId,
+      auth: { kind: 'automatic-oauth' },
+    });
+
+    const applied = await applyPlan(plan.planId);
+    const override = JSON.parse(await readFile(piPath, 'utf8')) as {
+      mcpServers: Record<string, Record<string, unknown>>;
+    };
+    expect(override.mcpServers.layered).toMatchObject({
+      requestTimeoutMs: 30_000,
+      headers: {},
+      auth: 'oauth',
+      oauth: {},
+    });
+    const effective = (await loadNativeSnapshot(workspace)).occurrences.find(
+      (entry) => entry.agentId === 'pi' && entry.name === 'layered' && entry.source.effective,
+    );
+    expect(effective).toMatchObject({
+      transport: { headers: undefined },
+      auth: { oauthMode: 'automatic', credentialKind: 'none' },
+    });
+
+    await undoApply(applied.undoToken);
   });
 
   it('refuses a plan when any contributing source layer changes', async () => {
