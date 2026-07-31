@@ -16,10 +16,12 @@ import {
   GripVertical,
   KeyRound,
   Minus,
+  Moon,
   Plus,
   RefreshCw,
   Search,
   ShieldCheck,
+  Sun,
   Undo2,
   X,
 } from 'lucide-react';
@@ -75,6 +77,8 @@ interface Notice {
   message: string;
   undoToken?: string;
 }
+
+type Theme = 'dark' | 'light';
 
 type LobeIconStyle = CSSProperties & { '--lobe-icon': string };
 
@@ -277,6 +281,15 @@ function authLabel(auth: PublicAuth): string {
 }
 
 function App() {
+  const [theme, setTheme] = useState<Theme>(() => {
+    try {
+      const savedTheme = window.localStorage.getItem('mcp-matrix-theme');
+      if (savedTheme === 'dark' || savedTheme === 'light') return savedTheme;
+    } catch {
+      // Use the system preference when storage is unavailable.
+    }
+    return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  });
   const [snapshot, setSnapshot] = useState<SnapshotResponse>();
   const [workspace, setWorkspace] = useState('');
   const [search, setSearch] = useState('');
@@ -308,6 +321,19 @@ function App() {
   useEffect(() => {
     void scan();
   }, [scan]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.querySelector('meta[name="theme-color"]')?.setAttribute(
+      'content',
+      theme === 'light' ? '#f7f8fa' : '#101114',
+    );
+    try {
+      window.localStorage.setItem('mcp-matrix-theme', theme);
+    } catch {
+      // The active theme still applies when storage is unavailable.
+    }
+  }, [theme]);
 
   const rows = useMemo(() => buildRows(snapshot), [snapshot]);
   const visibleRows = useMemo(() => {
@@ -476,7 +502,7 @@ function App() {
   };
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-theme={theme}>
       <aside className="activity-bar" aria-label="Primary navigation">
         <div className="brand-mark" title="MCP Matrix">
           <MCP size={21} />
@@ -485,6 +511,15 @@ function App() {
           <span className="matrix-glyph"><i /><i /><i /><i /></span>
         </button>
         <div className="activity-spacer" />
+        <button
+          className="activity-item theme-toggle"
+          type="button"
+          aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+          title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+          onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}
+        >
+          {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
+        </button>
         <div className="local-badge" title="Local-only configuration manager">
           <ShieldCheck size={15} />
         </div>
