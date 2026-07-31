@@ -24,7 +24,7 @@ import {
   updateAuthInContent,
 } from './adapters';
 import { looksLikeLiteralSecret, maskSecretPatterns, sha256 } from './domain';
-import type { NativeConfigSource } from './discovery';
+import { piAgentDirectory, type NativeConfigSource } from './discovery';
 
 interface InternalPlan extends ChangePlan {
   originalContent: string;
@@ -108,11 +108,16 @@ function defaultTargetPath(agentId: AgentId): string {
       return join(home, '.config', 'amp', 'settings.json');
     case 'opencode':
       return join(process.env.XDG_CONFIG_HOME ?? join(home, '.config'), 'opencode', 'opencode.json');
+    case 'pi':
+      return join(piAgentDirectory(), 'mcp.json');
   }
 }
 
 function chooseTargetSource(agentId: AgentId, sources: NativeConfigSource[]): string {
   const userSources = sources.filter((source) => source.agentId === agentId && source.scope === 'user');
+  if (agentId === 'pi') {
+    return userSources.find((source) => source.selector === 'pi-owned')?.path ?? defaultTargetPath(agentId);
+  }
   return userSources[0]?.path ?? defaultTargetPath(agentId);
 }
 
@@ -124,7 +129,7 @@ function redactNativeSpec(value: unknown, parentKey = ''): unknown {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>).map(([key, entry]) => {
         if (
-          (environmentHeaderContainer || key === 'bearer_token_env_var') &&
+          (environmentHeaderContainer || key === 'bearer_token_env_var' || key === 'bearerTokenEnv') &&
           typeof entry === 'string' &&
           /^[A-Za-z_][A-Za-z0-9_]*$/.test(entry)
         ) {
@@ -132,7 +137,7 @@ function redactNativeSpec(value: unknown, parentKey = ''): unknown {
         }
         if (sensitiveContainer) {
           const reference = typeof entry === 'string'
-            ? entry.match(/^([^{}$\r\n]{0,64})(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\{env:[A-Za-z_][A-Za-z0-9_]*\})$/)
+            ? entry.match(/^([^{}$\r\n]{0,64})(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$env:[A-Za-z_][A-Za-z0-9_]*|\{env:[A-Za-z_][A-Za-z0-9_]*\})$/)
             : undefined;
           const isReference = Boolean(reference && !looksLikeLiteralSecret('', reference[1]));
           return [key, isReference ? entry : '••••••••'];
@@ -146,7 +151,7 @@ function redactNativeSpec(value: unknown, parentKey = ''): unknown {
           }
         }
         if (/token|secret|password|authorization|cookie|api.?key/i.test(key)) {
-          const preservedReference = typeof entry === 'string' && /^(?:\$\{|\{env:)/.test(entry);
+          const preservedReference = typeof entry === 'string' && /^(?:\$\{|\$env:|\{env:)/.test(entry);
           return [key, preservedReference ? entry : '••••••••'];
         }
         return [key, redactNativeSpec(entry, key)];
@@ -192,7 +197,9 @@ function focusedDiff(agentId: AgentId, targetPath: string, name: string, spec: R
 function authPreviewSpec(agentId: AgentId, spec: Record<string, unknown>): Record<string, unknown> {
   const keys = agentId === 'codex'
     ? ['bearer_token_env_var', 'http_headers', 'env_http_headers', 'auth', 'scopes', 'oauth_resource']
-    : ['headers', 'oauth'];
+    : agentId === 'pi'
+      ? ['headers', 'auth', 'bearerToken', 'bearerTokenEnv', 'oauth']
+      : ['headers', 'oauth'];
   return Object.fromEntries(keys.flatMap((key) => spec[key] === undefined ? [] : [[key, spec[key]]]));
 }
 

@@ -23,6 +23,14 @@ function homeDirectory(): string {
   return process.env.MCP_MATRIX_HOME ?? homedir();
 }
 
+export function piAgentDirectory(): string {
+  const configured = process.env.PI_CODING_AGENT_DIR?.trim();
+  if (!configured) return join(homeDirectory(), '.pi', 'agent');
+  if (configured === '~') return homeDirectory();
+  if (configured.startsWith('~/')) return join(homeDirectory(), configured.slice(2));
+  return resolve(configured);
+}
+
 const definitions: Record<AgentId, { label: string; command: string; userPath: () => string }> = {
   claude: {
     label: 'Claude Code',
@@ -48,6 +56,11 @@ const definitions: Record<AgentId, { label: string; command: string; userPath: (
     label: 'OpenCode',
     command: 'opencode',
     userPath: () => join(homeDirectory(), '.config', 'opencode', 'opencode.json'),
+  },
+  pi: {
+    label: 'Pi',
+    command: 'pi',
+    userPath: () => join(piAgentDirectory(), 'mcp.json'),
   },
 };
 
@@ -320,6 +333,48 @@ export async function discoverConfigSources(workspaceInput: string): Promise<Nat
       scope: 'project',
       precedence: 200,
     });
+  }
+
+  const piSources: Array<Omit<NativeConfigSource, 'agentId'>> = [
+    {
+      path: join(homeDirectory(), '.config', 'mcp', 'mcp.json'),
+      scope: 'user',
+      precedence: 100,
+      selector: 'pi-shared',
+    },
+    {
+      path: join(homeDirectory(), '.agents', 'mcp.json'),
+      scope: 'user',
+      precedence: 200,
+      selector: 'pi-shared',
+    },
+    {
+      path: join(homeDirectory(), '.agents', 'mcp', 'mcp.json'),
+      scope: 'user',
+      precedence: 300,
+      selector: 'pi-shared',
+    },
+    {
+      path: await userTargetPath('pi'),
+      scope: 'user',
+      precedence: 400,
+      selector: 'pi-owned',
+    },
+    {
+      path: join(workspace, '.mcp.json'),
+      scope: 'project',
+      precedence: 500,
+      selector: 'pi-shared',
+    },
+    {
+      path: join(workspace, '.pi', 'mcp.json'),
+      scope: 'project',
+      precedence: 600,
+      selector: 'pi-owned',
+    },
+  ];
+  for (const source of piSources) {
+    if (await fileExists(source.path)) sources.push({ agentId: 'pi', ...source });
   }
 
   return deduplicateConfigSources(sources);

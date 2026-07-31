@@ -65,8 +65,8 @@ function asStringRecord(value: unknown): Record<string, string> | undefined {
 }
 
 function environmentReferences(value: string): string[] {
-  return [...value.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}|\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g)]
-    .map((match) => match[1] ?? match[2]);
+  return [...value.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}|\$env:([A-Za-z_][A-Za-z0-9_]*)|\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g)]
+    .map((match) => match[1] ?? match[2] ?? match[3]);
 }
 
 function isCredentialHeader(key: string): boolean {
@@ -86,7 +86,7 @@ function credentialAuth(headers: Record<string, string> | undefined): Pick<
   )].sort();
   const bearerEnvironment = credentialEntries.length === 1 &&
     credentialEntries[0][0].toLocaleLowerCase() === 'authorization' &&
-    /^Bearer\s+(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\{env:[A-Za-z_][A-Za-z0-9_]*\})$/.test(
+    /^Bearer\s+(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$env:[A-Za-z_][A-Za-z0-9_]*|\{env:[A-Za-z_][A-Za-z0-9_]*\})$/.test(
       credentialEntries[0][1],
     );
   return {
@@ -108,7 +108,7 @@ function baseAuth(transport: RawTransport): RawAuth {
 }
 
 function normalizeJsonAuth(
-  agentId: Exclude<AgentId, 'codex' | 'opencode'>,
+  agentId: Exclude<AgentId, 'codex' | 'opencode' | 'pi'>,
   spec: UnknownRecord,
   transport: RawTransport,
 ): RawAuth {
@@ -188,7 +188,7 @@ function parseJsonDocument(content: string): { data?: UnknownRecord; error?: str
 }
 
 function transportKindFromType(
-  agentId: Exclude<AgentId, 'codex' | 'opencode'>,
+  agentId: Exclude<AgentId, 'codex' | 'opencode' | 'pi'>,
   type: string | undefined,
   url: string | undefined,
 ): TransportKind {
@@ -201,7 +201,7 @@ function transportKindFromType(
 }
 
 function normalizeJsonSpec(
-  agentId: Exclude<AgentId, 'codex' | 'opencode'>,
+  agentId: Exclude<AgentId, 'codex' | 'opencode' | 'pi'>,
   source: NativeConfigSource,
   name: string,
   spec: UnknownRecord,
@@ -336,6 +336,107 @@ function normalizeOpenCodeSpec(
   };
 }
 
+function normalizePiSpec(
+  source: NativeConfigSource,
+  name: string,
+  spec: UnknownRecord,
+  fileHash: string,
+  nativeKey = 'mcpServers',
+): RawMcpOccurrence {
+  const command = asString(spec.command);
+  const url = asString(spec.url);
+  const socket = asString(spec.socket);
+  const configuredTransports = [command, url, socket].filter(Boolean).length;
+  const resolveEscapedCommandValue = (value: string) => value.startsWith('!!') ? value.slice(1) : value;
+  const headers = mapStringRecord(asStringRecord(spec.headers), resolveEscapedCommandValue) ?? {};
+  const bearerTokenValue = asString(spec.bearerToken);
+  const bearerToken = bearerTokenValue ? resolveEscapedCommandValue(bearerTokenValue) : undefined;
+  const bearerTokenEnvironment = asString(spec.bearerTokenEnv);
+  if (asString(spec.auth) === 'bearer') {
+    if (bearerToken) headers.Authorization = `Bearer ${bearerToken}`;
+    else if (bearerTokenEnvironment) headers.Authorization = `Bearer \${${bearerTokenEnvironment}}`;
+  }
+  const transport: RawTransport = {
+    kind:
+      configuredTransports !== 1
+        ? 'unknown'
+        : command
+          ? 'stdio'
+          : url
+            ? 'http'
+            : 'unknown',
+    command,
+    args: asStringArray(spec.args),
+    cwd: asString(spec.cwd),
+    url,
+    env: mapStringRecord(asStringRecord(spec.env), resolveEscapedCommandValue),
+    headers: Object.keys(headers).length ? headers : undefined,
+  };
+  const auth = baseAuth(transport);
+  const oauthValue = spec.oauth;
+  if (transport.kind !== 'stdio' && transport.kind !== 'unknown') {
+    if (spec.auth === false || oauthValue === false) {
+      auth.oauthMode = 'disabled';
+    } else {
+      const oauth = asRecord(oauthValue);
+      if (oauth) {
+        auth.clientId = asString(oauth.clientId);
+        auth.clientSecret = asString(oauth.clientSecret);
+        auth.oauthMode = auth.clientId ? 'pre-registered' : 'automatic';
+        const scope = asString(oauth.scope);
+        if (scope) auth.scopes = scope.split(/\s+/).filter(Boolean);
+        auth.environmentVariables = [...new Set([
+          ...auth.environmentVariables,
+          ...(auth.clientSecret ? environmentReferences(auth.clientSecret) : []),
+        ])].sort();
+      }
+    }
+  }
+  const warnings: string[] = [];
+  if (configuredTransports === 0) {
+    warnings.push('Pi adapter server needs exactly one of command, url, or socket.');
+  } else if (configuredTransports > 1) {
+    warnings.push('Pi adapter server cannot combine command, url, and socket transports.');
+  } else if (socket) {
+    warnings.push('The pi-mcp-adapter rmcp-mux socket transport is client-specific and cannot be distributed.');
+  } else if (url) {
+    warnings.push('pi-mcp-adapter probes Streamable HTTP and falls back to legacy SSE for remote URLs.');
+  }
+  const configuredTimeoutMs = asNumber(spec.requestTimeoutMs);
+  const timeoutMs = configuredTimeoutMs !== undefined && configuredTimeoutMs > 0
+    ? configuredTimeoutMs
+    : undefined;
+  const includeTools = asStringArray(spec.includeTools);
+  const excludeTools = asStringArray(spec.excludeTools);
+  const enabled = asBoolean(spec.disabled) !== true;
+  const portable = { transport, auth: authFingerprint(auth), enabled, timeoutMs, includeTools, excludeTools };
+  const fingerprints = buildFingerprints(transport, portable, name);
+
+  return {
+    occurrenceId: buildOccurrenceId('pi', source.path, source.scope, name),
+    agentId: 'pi',
+    name,
+    transport,
+    auth,
+    enabled,
+    timeoutMs,
+    includeTools,
+    excludeTools,
+    ...fingerprints,
+    source: {
+      scope: source.scope,
+      path: source.path,
+      hash: fileHash,
+      effective: false,
+      precedence: source.precedence,
+    },
+    sourceRevisions: [{ path: source.path, hash: fileHash }],
+    nativePath: [nativeKey, name],
+    warnings,
+    native: spec,
+  };
+}
+
 function normalizeCodexSpec(
   source: NativeConfigSource,
   name: string,
@@ -416,6 +517,9 @@ function normalizeCodexSpec(
 function jsonServersForSource(source: NativeConfigSource, data: UnknownRecord): UnknownRecord {
   if (source.agentId === 'amp') return asRecord(data['amp.mcpServers']) ?? {};
   if (source.agentId === 'opencode') return asRecord(data.mcp) ?? {};
+  if (source.agentId === 'pi') {
+    return asRecord(data.mcpServers) ?? asRecord(data['mcp-servers']) ?? {};
+  }
   if (source.agentId === 'claude' && source.selector === 'claude-local') {
     const project = asRecord(asRecord(data.projects)?.[source.projectKey ?? '']);
     return asRecord(project?.mcpServers) ?? {};
@@ -480,6 +584,11 @@ async function parseSource(
 
   const servers = jsonServersForSource(source, parsed.data);
   const jsonAgentId = source.agentId;
+  const piNativeKey = asRecord(parsed.data.mcpServers)
+    ? 'mcpServers'
+    : asRecord(parsed.data['mcp-servers'])
+      ? 'mcp-servers'
+      : 'mcpServers';
   const disabledClaudeNames =
     jsonAgentId === 'claude'
       ? new Set(
@@ -494,6 +603,7 @@ async function parseSource(
     .map(([name, rawSpec]) => {
       const spec = asRecord(rawSpec)!;
       if (jsonAgentId === 'opencode') return normalizeOpenCodeSpec(source, name, spec, fileHash);
+      if (jsonAgentId === 'pi') return normalizePiSpec(source, name, spec, fileHash, piNativeKey);
       const enabled =
         jsonAgentId === 'droid'
           ? asBoolean(spec.disabled) !== true
@@ -529,10 +639,42 @@ function deepMerge(left: UnknownRecord, right: UnknownRecord): UnknownRecord {
   return output;
 }
 
+function mergePiSpec(left: UnknownRecord, right: UnknownRecord): UnknownRecord {
+  const output: UnknownRecord = { ...left };
+  if (typeof right.socket === 'string' && right.socket) {
+    for (const key of [
+      'command',
+      'args',
+      'env',
+      'cwd',
+      'url',
+      'headers',
+      'auth',
+      'bearerToken',
+      'bearerTokenEnv',
+      'oauth',
+    ]) delete output[key];
+  } else if (
+    (typeof right.command === 'string' && right.command) ||
+    (typeof right.url === 'string' && right.url)
+  ) {
+    delete output.socket;
+  }
+  if (typeof right.url === 'string' && right.url && right.url !== left.url) {
+    for (const key of ['headers', 'bearerToken', 'bearerTokenEnv']) delete output[key];
+    if (left.oauth !== false) delete output.oauth;
+  }
+  return { ...output, ...right };
+}
+
 function mergeLayeredOccurrences(occurrences: RawMcpOccurrence[]): RawMcpOccurrence[] {
   const groups = new Map<string, RawMcpOccurrence[]>();
   for (const occurrence of occurrences) {
-    if (occurrence.agentId !== 'opencode' && occurrence.agentId !== 'codex') continue;
+    if (
+      occurrence.agentId !== 'opencode' &&
+      occurrence.agentId !== 'codex' &&
+      occurrence.agentId !== 'pi'
+    ) continue;
     const key = `${occurrence.agentId}\0${occurrence.name}`;
     const values = groups.get(key) ?? [];
     values.push(occurrence);
@@ -542,10 +684,10 @@ function mergeLayeredOccurrences(occurrences: RawMcpOccurrence[]): RawMcpOccurre
   for (const values of groups.values()) {
     if (values.length < 2) continue;
     values.sort((left, right) => left.source.precedence - right.source.precedence);
-    const merged = values.reduce<UnknownRecord>(
-      (result, occurrence) => deepMerge(result, occurrence.native),
-      {},
-    );
+    const merged = values.reduce<UnknownRecord>((result, occurrence) =>
+      occurrence.agentId === 'pi'
+        ? mergePiSpec(result, occurrence.native)
+        : deepMerge(result, occurrence.native), {});
     const highest = values.at(-1)!;
     const source: NativeConfigSource = {
       agentId: highest.agentId,
@@ -553,9 +695,16 @@ function mergeLayeredOccurrences(occurrences: RawMcpOccurrence[]): RawMcpOccurre
       scope: highest.source.scope,
       precedence: highest.source.precedence,
     };
-    const normalized =
-      highest.agentId === 'opencode'
-        ? normalizeOpenCodeSpec(source, highest.name, merged, highest.source.hash)
+    const normalized = highest.agentId === 'opencode'
+      ? normalizeOpenCodeSpec(source, highest.name, merged, highest.source.hash)
+      : highest.agentId === 'pi'
+        ? normalizePiSpec(
+            source,
+            highest.name,
+            merged,
+            highest.source.hash,
+            typeof highest.nativePath?.[0] === 'string' ? highest.nativePath[0] : 'mcpServers',
+          )
         : normalizeCodexSpec(source, highest.name, merged, highest.source.hash);
     normalized.sourceRevisions = [
       ...new Map(
@@ -566,7 +715,11 @@ function mergeLayeredOccurrences(occurrences: RawMcpOccurrence[]): RawMcpOccurre
     ];
     normalized.warnings.unshift(
       `Effective entry merges ${values.length} ${
-        highest.agentId === 'opencode' ? 'OpenCode JSON' : 'Codex TOML'
+        highest.agentId === 'opencode'
+          ? 'OpenCode JSON'
+          : highest.agentId === 'pi'
+            ? 'pi-mcp-adapter JSON'
+            : 'Codex TOML'
       } configuration layers.`,
     );
     replacements.set(highest.occurrenceId, normalized);
@@ -588,28 +741,32 @@ export async function loadNativeSnapshot(workspace: string): Promise<NativeSnaps
 
 function replaceReferences(
   value: string,
-  target: 'dollar' | 'amp' | 'opencode',
+  target: 'dollar' | 'amp' | 'opencode' | 'pi',
   warnings: string[],
   errors: string[],
 ): string {
-  if (target === 'dollar' || target === 'amp') {
+  if (target !== 'opencode') {
     if (/\{file:[^}]+\}/.test(value)) {
       errors.push('OpenCode {file:...} references have no portable equivalent in the target agent.');
     }
-    if (target === 'amp' && /\$\{[A-Za-z_][A-Za-z0-9_]*:-[^}]*\}/.test(value)) {
-      errors.push('Amp does not document support for ${VAR:-default} references.');
+    if ((target === 'amp' || target === 'pi') && /\$\{[A-Za-z_][A-Za-z0-9_]*:-[^}]*\}/.test(value)) {
+      errors.push(`${target === 'pi' ? 'pi-mcp-adapter' : 'Amp'} does not document support for \${VAR:-default} references.`);
     }
-    return value.replace(/\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, '${$1}');
+    return value
+      .replace(/\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, '${$1}')
+      .replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/g, '${$1}');
   }
-  return value.replace(
-    /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g,
-    (_match, name: string, defaultValue: string | undefined) => {
-      if (defaultValue !== undefined) {
-        errors.push(`OpenCode cannot preserve the default value in \${${name}:-${defaultValue}}.`);
-      }
-      return `{env:${name}}`;
-    },
-  );
+  return value
+    .replace(
+      /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g,
+      (_match, name: string, defaultValue: string | undefined) => {
+        if (defaultValue !== undefined) {
+          errors.push(`OpenCode cannot preserve the default value in \${${name}:-${defaultValue}}.`);
+        }
+        return `{env:${name}}`;
+      },
+    )
+    .replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/g, '{env:$1}');
 }
 
 function mapStringRecord(
@@ -628,6 +785,7 @@ function applyPortableExtras(
 ): void {
   if (!source.enabled) {
     if (target === 'droid') spec.disabled = true;
+    else if (target === 'pi') spec.disabled = true;
     else if (target === 'codex' || target === 'opencode') spec.enabled = false;
     else warnings.push(`${target === 'claude' ? 'Claude Code' : 'Amp'} stores disable state outside this server entry; the new server will be enabled.`);
   }
@@ -636,18 +794,20 @@ function applyPortableExtras(
     if (target === 'claude') spec.timeout = source.timeoutMs;
     else if (target === 'droid') spec.timeoutMs = source.timeoutMs;
     else if (target === 'codex') spec.tool_timeout_sec = source.timeoutMs / 1_000;
+    else if (target === 'pi') spec.requestTimeoutMs = source.timeoutMs;
     else warnings.push(`${target === 'opencode' ? 'OpenCode timeout controls tool discovery' : 'Amp has no equivalent timeout field'}; the source tool-call timeout was omitted.`);
   }
 
   if (source.includeTools?.length) {
     if (target === 'droid') spec.enabledTools = source.includeTools;
     else if (target === 'codex') spec.enabled_tools = source.includeTools;
-    else if (target === 'amp') spec.includeTools = source.includeTools;
+    else if (target === 'amp' || target === 'pi') spec.includeTools = source.includeTools;
     else warnings.push('The source tool allowlist has no equivalent per-server field and was omitted.');
   }
   if (source.excludeTools?.length) {
     if (target === 'droid') spec.disabledTools = source.excludeTools;
     else if (target === 'codex') spec.disabled_tools = source.excludeTools;
+    else if (target === 'pi') spec.excludeTools = source.excludeTools;
     else warnings.push('The source tool denylist has no equivalent per-server field and was omitted.');
   }
 }
@@ -687,6 +847,30 @@ const mappedNativeKeys: Record<AgentId, Set<string>> = {
   ]),
   amp: new Set(['command', 'args', 'url', 'env', 'headers', 'includeTools']),
   opencode: new Set(['type', 'command', 'cwd', 'url', 'environment', 'headers', 'oauth', 'enabled']),
+  pi: new Set([
+    'command',
+    'args',
+    'socket',
+    'env',
+    'cwd',
+    'url',
+    'headers',
+    'auth',
+    'bearerToken',
+    'bearerTokenEnv',
+    'oauth',
+    'lifecycle',
+    'idleTimeout',
+    'requestTimeoutMs',
+    'exposeResources',
+    'directTools',
+    'toolPrefix',
+    'includeTools',
+    'excludeTools',
+    'debug',
+    'trace',
+    'disabled',
+  ]),
 };
 
 function warnAboutClientSpecificFields(source: RawMcpOccurrence, warnings: string[]): void {
@@ -697,7 +881,7 @@ function warnAboutClientSpecificFields(source: RawMcpOccurrence, warnings: strin
 }
 
 function isReferenceBacked(value: string): boolean {
-  return /^(?:(?:Bearer|Basic|token)\s+)?(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\{env:[A-Za-z_][A-Za-z0-9_]*\}|\{file:[^}]+\})$/i.test(
+  return /^(?:(?:Bearer|Basic|token)\s+)?(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$env:[A-Za-z_][A-Za-z0-9_]*|\{env:[A-Za-z_][A-Za-z0-9_]*\}|\{file:[^}]+\})$/i.test(
     value,
   );
 }
@@ -741,6 +925,22 @@ function rejectLiteralSecrets(source: RawMcpOccurrence, errors: string[]): void 
   }
 }
 
+function rejectPiCommandProviders(source: RawMcpOccurrence, errors: string[]): void {
+  if (source.agentId !== 'pi') return;
+  const commandBacked = (value: string) => value.startsWith('!') && !value.startsWith('!!');
+  const fields: Array<readonly [string, string]> = [
+    ...Object.entries(asStringRecord(source.native.env) ?? {}).map(([key, value]) => [`environment value ${key}`, value] as const),
+    ...Object.entries(asStringRecord(source.native.headers) ?? {}).map(([key, value]) => [`HTTP header ${key}`, value] as const),
+  ];
+  const bearerToken = asString(source.native.bearerToken);
+  if (bearerToken) fields.push(['Bearer token', bearerToken]);
+  for (const [label, value] of fields) {
+    if (commandBacked(value)) {
+      errors.push(`Pi command-backed ${label} has no portable equivalent and was not copied.`);
+    }
+  }
+}
+
 function applyOAuthOverrides(
   target: AgentId,
   source: RawMcpOccurrence,
@@ -751,7 +951,7 @@ function applyOAuthOverrides(
   const hasCredentialHeaders = source.auth.credentialKind !== 'none';
 
   if (hasCredentialHeaders) {
-    if (target === 'droid' || target === 'opencode') spec.oauth = false;
+    if (target === 'droid' || target === 'opencode' || target === 'pi') spec.oauth = false;
     else if (target === 'codex') {
       warnings.push('Codex tries configured bearer/header credentials before its managed OAuth fallback.');
     }
@@ -759,7 +959,7 @@ function applyOAuthOverrides(
   }
 
   if (source.auth.oauthMode === 'disabled') {
-    if (target === 'droid' || target === 'opencode') spec.oauth = false;
+    if (target === 'droid' || target === 'opencode' || target === 'pi') spec.oauth = false;
     else warnings.push(`${target} has no native per-server oauth:false field; explicit OAuth disablement was omitted.`);
     return;
   }
@@ -792,7 +992,7 @@ function applyOAuthOverrides(
   } else if (target === 'droid') {
     if (scopes?.length) oauth.scopes = scopes;
     if (source.auth.resource !== undefined) oauth.resource = source.auth.resource;
-  } else if (target === 'opencode' && scopes?.length) {
+  } else if ((target === 'opencode' || target === 'pi') && scopes?.length) {
     oauth.scope = scopes.join(' ');
   }
   if (Object.keys(oauth).length) spec.oauth = oauth;
@@ -804,16 +1004,17 @@ function serializeCodex(source: RawMcpOccurrence): NativeSerialization {
   const spec: UnknownRecord = {};
   warnAboutClientSpecificFields(source, warnings);
   rejectLiteralSecrets(source, errors);
+  rejectPiCommandProviders(source, errors);
   if (source.transport.kind === 'sse' || source.transport.kind === 'websocket') {
     errors.push('Codex supports stdio and Streamable HTTP, not this legacy remote transport.');
     return { warnings, errors };
   }
   if (source.transport.kind === 'stdio') {
     if (!source.transport.command) errors.push('The source stdio server has no command.');
-    if (/\$\{|\{env:|\{file:/.test(source.transport.command ?? '')) {
+    if (/\$\{|\$env:|\{env:|\{file:/.test(source.transport.command ?? '')) {
       errors.push('Codex cannot preserve environment substitution inside the command.');
     }
-    if ((source.transport.args ?? []).some((value) => /\$\{|\{env:|\{file:/.test(value))) {
+    if ((source.transport.args ?? []).some((value) => /\$\{|\$env:|\{env:|\{file:/.test(value))) {
       errors.push('Codex cannot preserve environment substitution inside command arguments.');
     }
     spec.command = source.transport.command;
@@ -830,7 +1031,7 @@ function serializeCodex(source: RawMcpOccurrence): NativeSerialization {
     if (Object.keys(literalEnv).length) spec.env = literalEnv;
     if (forwarded.length) spec.env_vars = forwarded;
   } else if (source.transport.kind === 'http') {
-    if (/\$\{|\{env:|\{file:/.test(source.transport.url ?? '')) {
+    if (/\$\{|\$env:|\{env:|\{file:/.test(source.transport.url ?? '')) {
       errors.push('Codex cannot preserve environment or file substitution inside the server URL.');
     }
     spec.url = source.transport.url;
@@ -838,13 +1039,14 @@ function serializeCodex(source: RawMcpOccurrence): NativeSerialization {
     const environmentHeaders: Record<string, string> = {};
     for (const [key, value] of Object.entries(source.transport.headers ?? {})) {
       const bearer = value.match(/^Bearer\s+\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/);
+      const piBearer = value.match(/^Bearer\s+\$env:([A-Za-z_][A-Za-z0-9_]*)$/);
       const openCodeBearer = value.match(/^Bearer\s+\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/);
       const reference = parsePureEnvironmentReference(value);
-      if (key.toLocaleLowerCase() === 'authorization' && (bearer || openCodeBearer)) {
-        spec.bearer_token_env_var = (bearer ?? openCodeBearer)![1];
+      if (key.toLocaleLowerCase() === 'authorization' && (bearer || piBearer || openCodeBearer)) {
+        spec.bearer_token_env_var = (bearer ?? piBearer ?? openCodeBearer)![1];
       } else if (reference && reference.defaultValue === undefined) {
         environmentHeaders[key] = reference.name;
-      } else if (/\$\{|\{env:|\{file:/.test(value)) {
+      } else if (/\$\{|\$env:|\{env:|\{file:/.test(value)) {
         errors.push(`Codex cannot preserve the templated value of HTTP header ${key}.`);
       } else {
         staticHeaders[key] = value;
@@ -867,6 +1069,7 @@ export function serializeForAgent(target: AgentId, source: RawMcpOccurrence): Na
   const spec: UnknownRecord = {};
   warnAboutClientSpecificFields(source, warnings);
   rejectLiteralSecrets(source, errors);
+  rejectPiCommandProviders(source, errors);
   const isRemote = source.transport.kind !== 'stdio';
 
   if (source.transport.kind === 'unknown') errors.push('The source transport is invalid or unknown.');
@@ -876,8 +1079,17 @@ export function serializeForAgent(target: AgentId, source: RawMcpOccurrence): Na
   if (source.transport.kind === 'sse' && target === 'opencode') {
     errors.push('OpenCode does not expose an explicit legacy SSE transport.');
   }
+  if (target === 'pi' && isRemote) {
+    warnings.push('pi-mcp-adapter will probe Streamable HTTP and fall back to legacy SSE for this URL.');
+  }
 
-  const targetSyntax = target === 'opencode' ? 'opencode' : target === 'amp' ? 'amp' : 'dollar';
+  const targetSyntax = target === 'opencode'
+    ? 'opencode'
+    : target === 'amp'
+      ? 'amp'
+      : target === 'pi'
+        ? 'pi'
+        : 'dollar';
   const transform = (value: string) => replaceReferences(value, targetSyntax, warnings, errors);
   if (target === 'opencode') {
     if (isRemote) {
@@ -895,7 +1107,7 @@ export function serializeForAgent(target: AgentId, source: RawMcpOccurrence): Na
       if (environment) spec.environment = environment;
     }
   } else if (isRemote) {
-    if (target !== 'amp') {
+    if (target !== 'amp' && target !== 'pi') {
       spec.type = source.transport.kind === 'http' ? 'http' : source.transport.kind;
     }
     spec.url = source.transport.url ? transform(source.transport.url) : source.transport.url;
@@ -905,7 +1117,7 @@ export function serializeForAgent(target: AgentId, source: RawMcpOccurrence): Na
     if (target === 'claude' || target === 'droid') spec.type = 'stdio';
     spec.command = source.transport.command ? transform(source.transport.command) : undefined;
     if (source.transport.args?.length) spec.args = source.transport.args.map(transform);
-    if (source.transport.cwd && target === 'claude') spec.cwd = transform(source.transport.cwd);
+    if (source.transport.cwd && (target === 'claude' || target === 'pi')) spec.cwd = transform(source.transport.cwd);
     else if (source.transport.cwd) warnings.push(`${target} has no documented portable cwd field; cwd was omitted.`);
     const env = mapStringRecord(source.transport.env, transform);
     if (env) spec.env = env;
@@ -941,7 +1153,9 @@ function addJsonServer(
   const initial = content.trim() ? content : '{}\n';
   const parsed = parseJsonDocument(initial);
   if (!parsed.data) throw new Error(parsed.error ?? 'Unable to parse target JSON configuration.');
-  const path = jsonPathForAgent(agentId, name);
+  const path = agentId === 'pi' && !asRecord(parsed.data.mcpServers) && asRecord(parsed.data['mcp-servers'])
+    ? ['mcp-servers', name]
+    : jsonPathForAgent(agentId, name);
   let cursor: unknown = parsed.data;
   for (const segment of path) {
     if (!asRecord(cursor) || !(segment in (cursor as UnknownRecord))) {
@@ -1001,14 +1215,27 @@ function applyJsonAuthUpdate(
 ): UnknownRecord {
   const spec = structuredClone(occurrence.native);
   const headers = withoutCredentialHeaders(asStringRecord(spec.headers));
+  const layeredPi = agentId === 'pi' && occurrence.sourceRevisions.length > 1;
   if (headers) spec.headers = headers;
+  else if (layeredPi) spec.headers = {};
   else delete spec.headers;
   delete spec.oauth;
+  if (agentId === 'pi') {
+    delete spec.auth;
+    delete spec.bearerToken;
+    delete spec.bearerTokenEnv;
+  }
 
   const environmentReference = (name: string) => agentId === 'opencode' ? `{env:${name}}` : `\${${name}}`;
   if (update.kind === 'bearer-environment') {
     validateEnvironmentVariable(update.environmentVariable);
-    spec.headers = { ...(headers ?? {}), Authorization: `Bearer ${environmentReference(update.environmentVariable)}` };
+    if (agentId === 'pi') {
+      spec.auth = 'bearer';
+      if (layeredPi) spec.bearerToken = environmentReference(update.environmentVariable);
+      else spec.bearerTokenEnv = update.environmentVariable;
+    } else {
+      spec.headers = { ...(headers ?? {}), Authorization: `Bearer ${environmentReference(update.environmentVariable)}` };
+    }
     if (agentId === 'droid' || agentId === 'opencode') spec.oauth = false;
     return spec;
   }
@@ -1023,11 +1250,13 @@ function applyJsonAuthUpdate(
       ...(headers ?? {}),
       [update.headerName]: `${prefix}${environmentReference(update.environmentVariable)}`,
     };
-    if (agentId === 'droid' || agentId === 'opencode') spec.oauth = false;
+    if (agentId === 'droid' || agentId === 'opencode' || agentId === 'pi') spec.oauth = false;
+    if (agentId === 'pi') spec.auth = false;
     return spec;
   }
   if (update.kind === 'oauth-disabled') {
-    if (agentId !== 'droid' && agentId !== 'opencode') {
+    if (agentId === 'pi') spec.auth = false;
+    else if (agentId !== 'droid' && agentId !== 'opencode') {
       errors.push(`${agentId} has no native per-server oauth:false field.`);
     } else spec.oauth = false;
     return spec;
@@ -1043,15 +1272,36 @@ function applyJsonAuthUpdate(
     } else if (agentId === 'opencode') {
       if (update.scopes?.length) oauth.scope = update.scopes.join(' ');
       if (update.resource) warnings.push('OpenCode has no documented OAuth resource override; it was omitted.');
+    } else if (agentId === 'pi') {
+      spec.auth = 'oauth';
+      if (update.scopes?.length) oauth.scope = update.scopes.join(' ');
+      if (update.resource) warnings.push('pi-mcp-adapter has no per-server OAuth resource override; it was omitted.');
     } else if (agentId === 'amp' && (update.scopes?.length || update.resource)) {
       errors.push('Amp stores OAuth registration outside amp.mcpServers; use amp mcp oauth login for scopes or resource-specific registration.');
     }
-    if (Object.keys(oauth).length) spec.oauth = oauth;
+    if (Object.keys(oauth).length || layeredPi) spec.oauth = oauth;
     return spec;
   }
 
   if (agentId === 'amp') {
     errors.push('Amp stores pre-registered OAuth clients outside amp.mcpServers; use amp mcp oauth login.');
+    return spec;
+  }
+  if (agentId === 'pi') {
+    const oauth: UnknownRecord = { clientId: update.clientId };
+    spec.auth = 'oauth';
+    if (update.clientSecretEnvironmentVariable) {
+      validateEnvironmentVariable(update.clientSecretEnvironmentVariable);
+      oauth.clientSecret = `\${${update.clientSecretEnvironmentVariable}}`;
+    }
+    if (update.scopes?.length) oauth.scope = update.scopes.join(' ');
+    if (update.authorizationServerIssuer) {
+      warnings.push('pi-mcp-adapter discovers OAuth endpoints and has no issuer override; the supplied issuer was omitted.');
+    }
+    if (update.callbackPort !== undefined) {
+      warnings.push('pi-mcp-adapter requires an exact redirectUri rather than a callback port; the supplied port was omitted.');
+    }
+    spec.oauth = oauth;
     return spec;
   }
   if (agentId === 'opencode') {
@@ -1172,7 +1422,10 @@ function updateJsonAuthInContent(
 ): string {
   let output = content;
   const basePath = occurrence.nativePath ?? jsonPathForAgent(agentId, occurrence.name);
-  for (const key of ['headers', 'oauth']) {
+  const keys = agentId === 'pi'
+    ? ['headers', 'auth', 'bearerToken', 'bearerTokenEnv', 'oauth']
+    : ['headers', 'oauth'];
+  for (const key of keys) {
     output = applyEdits(
       output,
       modify(output, [...basePath, key], spec[key], { formattingOptions: formattingOptions(output) }),
